@@ -28,6 +28,9 @@
 #define TITLE_ICON_SIZE 16
 #define TITLE_TEXT_LEFT_PADDING 10
 #define RESIZE_HIT_THICKNESS 8
+#define EDIT_SCROLLBAR_WIDTH 10
+#define EDIT_SCROLLBAR_GAP 4
+#define EDIT_SCROLLBAR_MIN_THUMB_HEIGHT 24
 #define IDT_ICON_MARQUEE 50001
 #define IDT_SAVE_NOTIFICATION 50002
 #define ICON_MARQUEE_INTERVAL_MS 160
@@ -90,6 +93,11 @@ static BOOL g_titleHovered = TRUE;
 static BOOL g_clientMouseTracking = FALSE;
 static BOOL g_editMouseTracking = FALSE;
 static BOOL g_ncMouseTracking = FALSE;
+static BOOL g_editorScrollBarVisible = FALSE;
+static BOOL g_editorScrollBarDragging = FALSE;
+static BOOL g_editorLayoutUpdating = FALSE;
+static int g_editorScrollBarDragY = 0;
+static int g_editorScrollBarDragFirstLine = 0;
 static HICON g_marqueeSmallIcon = NULL;
 static HICON g_marqueeBigIcon = NULL;
 static int g_marqueeOffset = 0;
@@ -101,6 +109,7 @@ static BOOL AddTrayIcon(HWND hwnd);
 static void UpdateIconMarquee(HWND hwnd);
 static void StartIconMarquee(HWND hwnd);
 static void StopIconMarquee(HWND hwnd);
+static void RefreshEditorScrollBar(HWND hwnd, BOOL updateLayout);
 
 typedef enum UiTextId {
     UI_TEXT_ALWAYS_ON_TOP = 0,
@@ -378,6 +387,21 @@ static COLORREF GetReadableTitleTextColor(COLORREF backgroundColor)
     int luminance = (red * 299 + green * 587 + blue * 114) / 1000;
 
     return luminance >= 140 ? RGB(0, 0, 0) : RGB(255, 255, 255);
+}
+
+static COLORREF BlendColor(COLORREF first, COLORREF second, int secondPercent)
+{
+    int firstPercent = 100 - secondPercent;
+    int red = (GetRValue(first) * firstPercent +
+               GetRValue(second) * secondPercent) / 100;
+    int green = (GetGValue(first) * firstPercent +
+                 GetGValue(second) * secondPercent) / 100;
+    int blue = (GetBValue(first) * firstPercent +
+                GetBValue(second) * secondPercent) / 100;
+
+    return RGB(ClampInt(red, 0, 255),
+               ClampInt(green, 0, 255),
+               ClampInt(blue, 0, 255));
 }
 
 static BOOL IsTitleBarVisible(void)
@@ -789,6 +813,7 @@ static void ApplyEditorFont(void)
     oldFont = g_editFont;
     g_editFont = newFont;
     SendMessageW(g_editWindow, WM_SETFONT, (WPARAM)g_editFont, TRUE);
+    RefreshEditorScrollBar(g_mainWindow, TRUE);
 
     if (oldFont) {
         DeleteObject(oldFont);
@@ -1150,11 +1175,13 @@ static void ResizeEditControl(HWND hwnd)
     RECT clientRect;
     int width = 0;
     int height = 0;
+    int editorWidth = 0;
 
     if (!g_editWindow) {
         return;
     }
 
+    g_editorLayoutUpdating = TRUE;
     GetClientRect(hwnd, &clientRect);
     width = clientRect.right - clientRect.left - (BORDER_THICKNESS * 2);
     height = clientRect.bottom - clientRect.top -
@@ -1166,11 +1193,385 @@ static void ResizeEditControl(HWND hwnd)
         height = 0;
     }
 
+    editorWidth = width;
+    if (g_editorScrollBarVisible) {
+        editorWidth -= EDIT_SCROLLBAR_WIDTH + EDIT_SCROLLBAR_GAP;
+        if (editorWidth < 0) {
+            editorWidth = 0;
+        }
+    }
+
     MoveWindow(g_editWindow, BORDER_THICKNESS,
                CUSTOM_TITLE_BAR_HEIGHT + BORDER_THICKNESS,
-               width,
+               editorWidth,
                height,
                TRUE);
+    g_editorLayoutUpdating = FALSE;
+    RefreshEditorScrollBar(hwnd, TRUE);
+}
+
+static void GetEditorAreaRect(HWND hwnd, RECT *rect)
+{
+    RECT clientRect;
+
+    if (!rect) {
+        return;
+    }
+
+    SetRectEmpty(rect);
+    if (!IsWindow(hwnd)) {
+        return;
+    }
+
+    GetClientRect(hwnd, &clientRect);
+    rect->left = BORDER_THICKNESS;
+    rect->top = CUSTOM_TITLE_BAR_HEIGHT + BORDER_THICKNESS;
+    rect->right = max(rect->left,
+                      clientRect.right - BORDER_THICKNESS);
+    rect->bottom = max(rect->top,
+                       clientRect.bottom - BORDER_THICKNESS);
+}
+
+static void GetEditorScrollBarRect(HWND hwnd, RECT *rect)
+{
+    RECT areaRect;
+
+    if (!rect) {
+        return;
+    }
+
+    GetEditorAreaRect(hwnd, &areaRect);
+    *rect = areaRect;
+    rect->left = max(rect->left, rect->right - EDIT_SCROLLBAR_WIDTH);
+}
+
+static int GetEditorLineHeight(void)
+{
+    HDC hdc = NULL;
+    HFONT oldFont = NULL;
+    TEXTMETRICW metrics;
+    int lineHeight = 16;
+
+    if (!g_editWindow) {
+        return lineHeight;
+    }
+
+    hdc = GetDC(g_editWindow);
+    if (!hdc) {
+        return lineHeight;
+    }
+
+    if (g_editFont) {
+        oldFont = (HFONT)SelectObject(hdc, g_editFont);
+    }
+
+    ZeroMemory(&metrics, sizeof(metrics));
+    if (GetTextMetricsW(hdc, &metrics)) {
+        lineHeight = max(1, metrics.tmHeight + metrics.tmExternalLeading);
+    }
+
+    if (oldFont) {
+        SelectObject(hdc, oldFont);
+    }
+    ReleaseDC(g_editWindow, hdc);
+    return lineHeight;
+}
+
+static int GetEditorVisibleLineCount(void)
+{
+    RECT editRect;
+    int lineHeight = GetEditorLineHeight();
+    int height = 0;
+
+    if (!g_editWindow || lineHeight <= 0) {
+        return 1;
+    }
+
+    GetClientRect(g_editWindow, &editRect);
+    height = editRect.bottom - editRect.top;
+    return max(1, height / lineHeight);
+}
+
+static int GetEditorLineCount(void)
+{
+    if (!g_editWindow) {
+        return 1;
+    }
+
+    return max(1, (int)SendMessageW(g_editWindow, EM_GETLINECOUNT, 0, 0));
+}
+
+static int GetEditorFirstVisibleLine(void)
+{
+    if (!g_editWindow) {
+        return 0;
+    }
+
+    return max(0, (int)SendMessageW(g_editWindow,
+                                    EM_GETFIRSTVISIBLELINE, 0, 0));
+}
+
+static int GetEditorMaxFirstVisibleLine(void)
+{
+    return max(0, GetEditorLineCount() - GetEditorVisibleLineCount());
+}
+
+static BOOL IsEditorScrollBarNeeded(void)
+{
+    return GetEditorMaxFirstVisibleLine() > 0;
+}
+
+static void InvalidateEditorScrollBar(HWND hwnd)
+{
+    RECT barRect;
+
+    if (!IsWindow(hwnd)) {
+        return;
+    }
+
+    GetEditorScrollBarRect(hwnd, &barRect);
+    InvalidateRect(hwnd, &barRect, TRUE);
+}
+
+static BOOL GetEditorScrollThumbRect(HWND hwnd, RECT *thumbRect)
+{
+    RECT barRect;
+    int lineCount = GetEditorLineCount();
+    int visibleLines = GetEditorVisibleLineCount();
+    int maxFirstLine = GetEditorMaxFirstVisibleLine();
+    int firstLine = min(GetEditorFirstVisibleLine(), maxFirstLine);
+    int trackHeight = 0;
+    int thumbHeight = 0;
+    int thumbTop = 0;
+
+    if (!thumbRect || !g_editorScrollBarVisible || maxFirstLine <= 0) {
+        if (thumbRect) {
+            SetRectEmpty(thumbRect);
+        }
+        return FALSE;
+    }
+
+    GetEditorScrollBarRect(hwnd, &barRect);
+    InflateRect(&barRect, -2, -4);
+    trackHeight = max(1, barRect.bottom - barRect.top);
+    thumbHeight = max(EDIT_SCROLLBAR_MIN_THUMB_HEIGHT,
+                      MulDiv(trackHeight, visibleLines, lineCount));
+    thumbHeight = min(thumbHeight, trackHeight);
+    thumbTop = barRect.top;
+    if (trackHeight > thumbHeight) {
+        thumbTop += MulDiv(trackHeight - thumbHeight,
+                           firstLine,
+                           maxFirstLine);
+    }
+
+    SetRect(thumbRect,
+            barRect.left,
+            thumbTop,
+            barRect.right,
+            thumbTop + thumbHeight);
+    return TRUE;
+}
+
+static void RefreshEditorScrollBar(HWND hwnd, BOOL updateLayout)
+{
+    BOOL needed = IsEditorScrollBarNeeded();
+
+    if (needed != g_editorScrollBarVisible) {
+        g_editorScrollBarVisible = needed;
+        if (updateLayout && !g_editorLayoutUpdating) {
+            ResizeEditControl(hwnd);
+            return;
+        }
+    }
+
+    InvalidateEditorScrollBar(hwnd);
+}
+
+static void ScrollEditorToFirstVisibleLine(HWND hwnd, int targetFirstLine)
+{
+    int currentFirstLine = GetEditorFirstVisibleLine();
+    int maxFirstLine = GetEditorMaxFirstVisibleLine();
+    int newFirstLine = ClampInt(targetFirstLine, 0, maxFirstLine);
+    int delta = newFirstLine - currentFirstLine;
+
+    if (!g_editWindow || delta == 0) {
+        RefreshEditorScrollBar(hwnd, FALSE);
+        return;
+    }
+
+    SendMessageW(g_editWindow, EM_LINESCROLL, 0, delta);
+    RefreshEditorScrollBar(hwnd, FALSE);
+}
+
+static BOOL IsPointInEditorScrollBar(HWND hwnd, int x, int y)
+{
+    RECT barRect;
+    POINT point;
+
+    if (!g_editorScrollBarVisible) {
+        return FALSE;
+    }
+
+    point.x = x;
+    point.y = y;
+    GetEditorScrollBarRect(hwnd, &barRect);
+    return PtInRect(&barRect, point);
+}
+
+static BOOL BeginEditorScrollBarDrag(HWND hwnd, int x, int y)
+{
+    RECT thumbRect;
+    POINT point;
+
+    if (!GetEditorScrollThumbRect(hwnd, &thumbRect)) {
+        return FALSE;
+    }
+
+    point.x = x;
+    point.y = y;
+    if (!PtInRect(&thumbRect, point)) {
+        return FALSE;
+    }
+
+    g_editorScrollBarDragging = TRUE;
+    g_editorScrollBarDragY = y;
+    g_editorScrollBarDragFirstLine = GetEditorFirstVisibleLine();
+    SetCapture(hwnd);
+    return TRUE;
+}
+
+static void PageEditorFromScrollBarClick(HWND hwnd, int y)
+{
+    RECT thumbRect;
+    int firstLine = GetEditorFirstVisibleLine();
+    int visibleLines = GetEditorVisibleLineCount();
+
+    if (!GetEditorScrollThumbRect(hwnd, &thumbRect)) {
+        return;
+    }
+
+    if (y < thumbRect.top) {
+        ScrollEditorToFirstVisibleLine(hwnd, firstLine - visibleLines);
+    } else if (y > thumbRect.bottom) {
+        ScrollEditorToFirstVisibleLine(hwnd, firstLine + visibleLines);
+    }
+}
+
+static void UpdateEditorScrollBarDrag(HWND hwnd, int y)
+{
+    RECT barRect;
+    RECT thumbRect;
+    int trackHeight = 0;
+    int thumbHeight = 0;
+    int availableHeight = 0;
+    int maxFirstLine = GetEditorMaxFirstVisibleLine();
+    int deltaY = y - g_editorScrollBarDragY;
+    int deltaLines = 0;
+
+    if (!g_editorScrollBarDragging ||
+        !GetEditorScrollThumbRect(hwnd, &thumbRect)) {
+        return;
+    }
+
+    GetEditorScrollBarRect(hwnd, &barRect);
+    InflateRect(&barRect, -2, -4);
+    trackHeight = max(1, barRect.bottom - barRect.top);
+    thumbHeight = max(1, thumbRect.bottom - thumbRect.top);
+    availableHeight = max(1, trackHeight - thumbHeight);
+    deltaLines = MulDiv(deltaY, maxFirstLine, availableHeight);
+
+    ScrollEditorToFirstVisibleLine(hwnd,
+                                   g_editorScrollBarDragFirstLine +
+                                       deltaLines);
+}
+
+static void EndEditorScrollBarDrag(HWND hwnd)
+{
+    if (!g_editorScrollBarDragging) {
+        return;
+    }
+
+    g_editorScrollBarDragging = FALSE;
+    if (GetCapture() == hwnd) {
+        ReleaseCapture();
+    }
+    RefreshEditorScrollBar(hwnd, FALSE);
+}
+
+static void DrawEditorScrollBar(HWND hwnd, HDC hdc)
+{
+    RECT barRect;
+    RECT trackRect;
+    RECT thumbRect;
+    HBRUSH trackBrush = NULL;
+    HBRUSH thumbBrush = NULL;
+    HPEN trackPen = NULL;
+    HPEN thumbPen = NULL;
+    HGDIOBJ oldBrush = NULL;
+    HGDIOBJ oldPen = NULL;
+    COLORREF trackColor = BlendColor(g_settings.editorBackgroundColor,
+                                     g_settings.borderColor, 12);
+    COLORREF thumbColor = BlendColor(g_settings.borderColor,
+                                     RGB(255, 255, 255), 18);
+    COLORREF thumbLineColor = BlendColor(g_settings.borderColor,
+                                         RGB(0, 0, 0), 8);
+
+    if (!g_editorScrollBarVisible ||
+        !GetEditorScrollThumbRect(hwnd, &thumbRect)) {
+        return;
+    }
+
+    GetEditorScrollBarRect(hwnd, &barRect);
+    trackRect = barRect;
+    InflateRect(&trackRect, -3, -4);
+
+    trackBrush = CreateSolidBrush(trackColor);
+    trackPen = CreatePen(PS_SOLID, 1, trackColor);
+    thumbBrush = CreateSolidBrush(thumbColor);
+    thumbPen = CreatePen(PS_SOLID, 1, thumbLineColor);
+    if (!trackBrush || !trackPen || !thumbBrush || !thumbPen) {
+        goto cleanup;
+    }
+
+    oldBrush = SelectObject(hdc, trackBrush);
+    oldPen = SelectObject(hdc, trackPen);
+    RoundRect(hdc,
+              trackRect.left,
+              trackRect.top,
+              trackRect.right,
+              trackRect.bottom,
+              EDIT_SCROLLBAR_WIDTH,
+              EDIT_SCROLLBAR_WIDTH);
+
+    SelectObject(hdc, thumbBrush);
+    SelectObject(hdc, thumbPen);
+    RoundRect(hdc,
+              thumbRect.left,
+              thumbRect.top,
+              thumbRect.right,
+              thumbRect.bottom,
+              EDIT_SCROLLBAR_WIDTH,
+              EDIT_SCROLLBAR_WIDTH);
+
+cleanup:
+    if (oldBrush) {
+        SelectObject(hdc, oldBrush);
+    }
+    if (oldPen) {
+        SelectObject(hdc, oldPen);
+    }
+    if (trackBrush) {
+        DeleteObject(trackBrush);
+    }
+    if (trackPen) {
+        DeleteObject(trackPen);
+    }
+    if (thumbBrush) {
+        DeleteObject(thumbBrush);
+    }
+    if (thumbPen) {
+        DeleteObject(thumbPen);
+    }
 }
 
 static BOOL CreateEditControl(HWND hwnd)
@@ -1179,7 +1580,7 @@ static BOOL CreateEditControl(HWND hwnd)
         0,
         L"EDIT",
         L"",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+        WS_CHILD | WS_VISIBLE |
             ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL |
             ES_WANTRETURN | ES_NOHIDESEL,
         0,
@@ -2032,6 +2433,9 @@ static void HandleCommand(HWND hwnd, int commandId)
 
 static LRESULT CALLBACK EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    BOOL refreshAfter = FALSE;
+    LRESULT result = 0;
+
     switch (message) {
     case WM_CHAR:
         if (wParam == 1) {
@@ -2042,6 +2446,26 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
             SaveCurrentStateWithNotification(g_mainWindow);
             return 0;
         }
+        refreshAfter = TRUE;
+        break;
+    case WM_KEYUP:
+    case WM_LBUTTONUP:
+    case WM_PASTE:
+    case WM_CUT:
+    case WM_CLEAR:
+    case WM_UNDO:
+    case WM_SETTEXT:
+        refreshAfter = TRUE;
+        break;
+    case WM_MOUSEWHEEL:
+        if (g_editorScrollBarVisible) {
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            ScrollEditorToFirstVisibleLine(
+                g_mainWindow,
+                GetEditorFirstVisibleLine() - (delta / WHEEL_DELTA) * 3);
+            return 0;
+        }
+        refreshAfter = TRUE;
         break;
     case WM_MOUSEMOVE:
         TrackMouseLeave(hwnd, FALSE, &g_editMouseTracking);
@@ -2061,10 +2485,17 @@ static LRESULT CALLBACK EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
     }
 
     if (g_originalEditProc) {
-        return CallWindowProcW(g_originalEditProc, hwnd, message, wParam, lParam);
+        result = CallWindowProcW(g_originalEditProc, hwnd, message,
+                                 wParam, lParam);
+    } else {
+        result = DefWindowProcW(hwnd, message, wParam, lParam);
     }
 
-    return DefWindowProcW(hwnd, message, wParam, lParam);
+    if (refreshAfter) {
+        RefreshEditorScrollBar(g_mainWindow, TRUE);
+    }
+
+    return result;
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -2112,6 +2543,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         return 0;
 
     case WM_MOUSEMOVE:
+        if (g_editorScrollBarDragging) {
+            UpdateEditorScrollBarDrag(hwnd, GET_Y_LPARAM(lParam));
+            return 0;
+        }
         TrackMouseLeave(hwnd, FALSE, &g_clientMouseTracking);
         SetTitleHoverState(hwnd, TRUE);
         UpdateTitleButtonHover(hwnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
@@ -2159,10 +2594,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             InvalidateTitleBar(hwnd);
             return 0;
         }
+        if (BeginEditorScrollBarDrag(hwnd,
+                                     GET_X_LPARAM(lParam),
+                                     GET_Y_LPARAM(lParam))) {
+            return 0;
+        }
+        if (IsPointInEditorScrollBar(hwnd,
+                                     GET_X_LPARAM(lParam),
+                                     GET_Y_LPARAM(lParam))) {
+            PageEditorFromScrollBarClick(hwnd, GET_Y_LPARAM(lParam));
+            return 0;
+        }
         return DefWindowProcW(hwnd, message, wParam, lParam);
     }
 
     case WM_LBUTTONUP:
+        if (g_editorScrollBarDragging) {
+            EndEditorScrollBarDrag(hwnd);
+            return 0;
+        }
         if (g_pressedTitleButton != TITLE_BUTTON_NONE) {
             TitleButton pressedButton = g_pressedTitleButton;
             TitleButton releasedButton = HitTestTitleButton(hwnd,
@@ -2181,11 +2631,30 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         return DefWindowProcW(hwnd, message, wParam, lParam);
 
     case WM_CAPTURECHANGED:
+        if (g_editorScrollBarDragging) {
+            g_editorScrollBarDragging = FALSE;
+            RefreshEditorScrollBar(hwnd, FALSE);
+        }
         if (g_pressedTitleButton != TITLE_BUTTON_NONE) {
             g_pressedTitleButton = TITLE_BUTTON_NONE;
             InvalidateTitleBar(hwnd);
         }
         return DefWindowProcW(hwnd, message, wParam, lParam);
+
+    case WM_MOUSEWHEEL:
+    {
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        int firstLine = GetEditorFirstVisibleLine();
+        int scrollLines = 3;
+
+        if (g_editorScrollBarVisible) {
+            ScrollEditorToFirstVisibleLine(
+                hwnd,
+                firstLine - (delta / WHEEL_DELTA) * scrollLines);
+            return 0;
+        }
+        break;
+    }
 
     case WM_NCRBUTTONUP:
         if (wParam == HTCAPTION) {
@@ -2241,6 +2710,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         HDC hdc = BeginPaint(hwnd, &paint);
         if (hdc) {
             DrawCustomTitleBar(hwnd, hdc);
+            DrawEditorScrollBar(hwnd, hdc);
         }
         EndPaint(hwnd, &paint);
         return 0;

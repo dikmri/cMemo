@@ -205,8 +205,8 @@ static const UiTextEntry g_uiTexts[UI_TEXT_COUNT] = {
         L"通常表示"
     },
     [UI_TEXT_DISPLAY_MENU] = {
-        L"Display",
-        L"\u8868\u793A"
+        L"Display Mode",
+        L"表示モード"
     },
     [UI_TEXT_APPEARANCE_MENU] = {
         L"Appearance",
@@ -301,8 +301,8 @@ static const UiTextEntry g_uiTexts[UI_TEXT_COUNT] = {
         L"終了"
     },
     [UI_TEXT_SHOW] = {
-        L"Show",
-        L"表示"
+        L"Show Window",
+        L"ウィンドウを表示"
     },
     [UI_TEXT_HELP_MENU] = {
         L"Help",

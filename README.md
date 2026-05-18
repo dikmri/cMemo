@@ -1,3 +1,5 @@
+![cMemo logo](pics/logo.png)
+
 # cMemo
 
 Windows 10 向けの軽量な常駐メモアプリ。C と Win32 API のみで実装。

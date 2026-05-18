@@ -65,6 +65,7 @@
 #define IDM_ICON_MARQUEE_BACKGROUND_COLOR 40021
 #define IDM_EDITOR_BACKGROUND_COLOR 40022
 #define IDM_TOGGLE_ICON_MARQUEE_REVERSE 40023
+#define IDM_VERSION_CHECK 40024
 #define IDM_FONT_SIZE_6 40030
 #define IDM_FONT_SIZE_7 40031
 #define IDM_FONT_SIZE_8 40032
@@ -78,7 +79,11 @@
 
 #define TRAY_ICON_UID 1
 #define WMAPP_TRAYICON (WM_APP + 1)
-#define WMAPP_UPDATE_READY (WM_APP + 2)
+#define WMAPP_UPDATE_AVAILABLE (WM_APP + 2)
+#define WMAPP_UPDATE_NOT_AVAILABLE (WM_APP + 3)
+#define WMAPP_UPDATE_CHECK_FAILED (WM_APP + 4)
+#define WMAPP_UPDATE_READY (WM_APP + 5)
+#define WMAPP_UPDATE_DOWNLOAD_FAILED (WM_APP + 6)
 #define RUN_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define RUN_VALUE_NAME L"cMemo"
 
@@ -109,7 +114,10 @@ static HICON g_marqueeSmallIcon = NULL;
 static HICON g_marqueeBigIcon = NULL;
 static int g_marqueeOffset = 0;
 static UINT g_taskbarCreatedMessage = 0;
-static BOOL g_updateCheckStarted = FALSE;
+static volatile LONG g_updateCheckInProgress = 0;
+static volatile LONG g_updateDownloadInProgress = 0;
+static WCHAR g_availableUpdateUrl[2048];
+static WCHAR g_availableUpdateVersion[32];
 static WCHAR g_pendingUpdatePath[MAX_PATH];
 static WCHAR g_pendingUpdateVersion[32];
 
@@ -120,7 +128,7 @@ static void UpdateIconMarquee(HWND hwnd);
 static void StartIconMarquee(HWND hwnd);
 static void StopIconMarquee(HWND hwnd);
 static void RefreshEditorScrollBar(HWND hwnd, BOOL updateLayout);
-static void StartUpdateCheck(HWND hwnd);
+static void StartUpdateCheck(HWND hwnd, BOOL manual);
 static BOOL SaveCurrentState(HWND hwnd);
 
 typedef enum UiTextId {
@@ -153,6 +161,16 @@ typedef enum UiTextId {
     UI_TEXT_SAVE_ERROR,
     UI_TEXT_EXIT,
     UI_TEXT_SHOW,
+    UI_TEXT_HELP_MENU,
+    UI_TEXT_VERSION_CHECK,
+    UI_TEXT_UPDATE_CHECKING,
+    UI_TEXT_UPDATE_ALREADY_CHECKING,
+    UI_TEXT_UPDATE_ALREADY_DOWNLOADING,
+    UI_TEXT_UPDATE_AVAILABLE_PROMPT,
+    UI_TEXT_UPDATE_NOT_AVAILABLE,
+    UI_TEXT_UPDATE_CHECK_FAILED,
+    UI_TEXT_UPDATE_DOWNLOAD_FAILED,
+    UI_TEXT_UPDATE_RESTARTING,
     UI_TEXT_STARTUP_SETTING_ERROR,
     UI_TEXT_REGISTER_CLASS_ERROR,
     UI_TEXT_CREATE_WINDOW_ERROR,
@@ -280,6 +298,46 @@ static const UiTextEntry g_uiTexts[UI_TEXT_COUNT] = {
     [UI_TEXT_SHOW] = {
         L"Show",
         L"表示"
+    },
+    [UI_TEXT_HELP_MENU] = {
+        L"Help",
+        L"ヘルプ"
+    },
+    [UI_TEXT_VERSION_CHECK] = {
+        L"Version / Check for Updates...",
+        L"バージョン / 更新の確認..."
+    },
+    [UI_TEXT_UPDATE_CHECKING] = {
+        L"Current version: %s\n\nChecking for updates.",
+        L"現在のバージョン: %s\n\n更新を確認しています。"
+    },
+    [UI_TEXT_UPDATE_ALREADY_CHECKING] = {
+        L"An update check is already running.",
+        L"更新確認はすでに実行中です。"
+    },
+    [UI_TEXT_UPDATE_ALREADY_DOWNLOADING] = {
+        L"An update is already being downloaded.",
+        L"更新のダウンロードはすでに実行中です。"
+    },
+    [UI_TEXT_UPDATE_AVAILABLE_PROMPT] = {
+        L"Current version: %s\nLatest version: %s\n\nUpdate to the latest version now?",
+        L"現在のバージョン: %s\n最新バージョン: %s\n\n最新版に更新しますか？"
+    },
+    [UI_TEXT_UPDATE_NOT_AVAILABLE] = {
+        L"Current version: %s\nLatest version: %s\n\nYou are using the latest version.",
+        L"現在のバージョン: %s\n最新バージョン: %s\n\n最新版を使用しています。"
+    },
+    [UI_TEXT_UPDATE_CHECK_FAILED] = {
+        L"Current version: %s\n\nFailed to check for updates.",
+        L"現在のバージョン: %s\n\n更新を確認できませんでした。"
+    },
+    [UI_TEXT_UPDATE_DOWNLOAD_FAILED] = {
+        L"Failed to download the update.",
+        L"更新をダウンロードできませんでした。"
+    },
+    [UI_TEXT_UPDATE_RESTARTING] = {
+        L"The update is ready.\nThe app will restart now.",
+        L"更新の準備ができました。\nアプリを再起動します。"
     },
     [UI_TEXT_STARTUP_SETTING_ERROR] = {
         L"Failed to update the Windows startup setting.",
@@ -1619,24 +1677,43 @@ static BOOL LaunchUpdaterAndExit(HWND hwnd)
     return TRUE;
 }
 
+typedef struct UpdateCheckContext {
+    HWND hwnd;
+    BOOL manual;
+} UpdateCheckContext;
+
+typedef struct UpdateDownloadContext {
+    HWND hwnd;
+    WCHAR downloadUrl[2048];
+    WCHAR latestVersion[32];
+} UpdateDownloadContext;
+
 static DWORD WINAPI UpdateCheckThreadProc(LPVOID parameter)
 {
-    HWND hwnd = (HWND)parameter;
+    UpdateCheckContext *context = (UpdateCheckContext *)parameter;
+    HWND hwnd = context ? context->hwnd : NULL;
+    BOOL manual = context ? context->manual : FALSE;
     BYTE *jsonBytes = NULL;
     DWORD jsonSize = 0;
     char latestTag[64];
     char downloadUrl[2048];
     char latestVersion[64];
     WCHAR downloadUrlW[2048];
-    WCHAR tempPath[MAX_PATH];
-    WCHAR updatePath[MAX_PATH];
 
     UNREFERENCED_PARAMETER(jsonSize);
+
+    if (context) {
+        HeapFree(GetProcessHeap(), 0, context);
+    }
 
     if (!ReadUrlToMemory(GITHUB_LATEST_RELEASE_API,
                          &jsonBytes,
                          &jsonSize,
                          1024 * 1024)) {
+        if (manual && IsWindow(hwnd)) {
+            PostMessageW(hwnd, WMAPP_UPDATE_CHECK_FAILED, 0, 0);
+        }
+        InterlockedExchange(&g_updateCheckInProgress, 0);
         return 0;
     }
 
@@ -1648,60 +1725,199 @@ static DWORD WINAPI UpdateCheckThreadProc(LPVOID parameter)
                                    downloadUrl,
                                    sizeof(downloadUrl))) {
         HeapFree(GetProcessHeap(), 0, jsonBytes);
+        if (manual && IsWindow(hwnd)) {
+            PostMessageW(hwnd, WMAPP_UPDATE_CHECK_FAILED, 0, 0);
+        }
+        InterlockedExchange(&g_updateCheckInProgress, 0);
         return 0;
     }
     HeapFree(GetProcessHeap(), 0, jsonBytes);
 
     NormalizeVersionString(latestTag, latestVersion, sizeof(latestVersion));
     if (CompareVersionStrings(latestVersion, APP_VERSION_STRING) <= 0) {
+        if (Utf8ToWideString(latestVersion,
+                             g_availableUpdateVersion,
+                             ARRAYSIZE(g_availableUpdateVersion)) &&
+            manual && IsWindow(hwnd)) {
+            PostMessageW(hwnd, WMAPP_UPDATE_NOT_AVAILABLE, 0, 0);
+        }
+        InterlockedExchange(&g_updateCheckInProgress, 0);
         return 0;
     }
 
     if (!Utf8ToWideString(downloadUrl, downloadUrlW,
                           ARRAYSIZE(downloadUrlW))) {
+        if (manual && IsWindow(hwnd)) {
+            PostMessageW(hwnd, WMAPP_UPDATE_CHECK_FAILED, 0, 0);
+        }
+        InterlockedExchange(&g_updateCheckInProgress, 0);
         return 0;
     }
+
+    StringCchCopyW(g_availableUpdateUrl, ARRAYSIZE(g_availableUpdateUrl),
+                   downloadUrlW);
+    if (!Utf8ToWideString(latestVersion,
+                          g_availableUpdateVersion,
+                          ARRAYSIZE(g_availableUpdateVersion))) {
+        g_availableUpdateVersion[0] = L'\0';
+    }
+
+    InterlockedExchange(&g_updateCheckInProgress, 0);
+    if (IsWindow(hwnd)) {
+        PostMessageW(hwnd, WMAPP_UPDATE_AVAILABLE, manual ? 1 : 0, 0);
+    }
+    return 0;
+}
+
+static DWORD WINAPI UpdateDownloadThreadProc(LPVOID parameter)
+{
+    UpdateDownloadContext *context = (UpdateDownloadContext *)parameter;
+    HWND hwnd = context ? context->hwnd : NULL;
+    WCHAR downloadUrl[2048];
+    WCHAR latestVersion[32];
+    WCHAR tempPath[MAX_PATH];
+    WCHAR updatePath[MAX_PATH];
+
+    if (!context) {
+        InterlockedExchange(&g_updateDownloadInProgress, 0);
+        return 0;
+    }
+
+    StringCchCopyW(downloadUrl, ARRAYSIZE(downloadUrl), context->downloadUrl);
+    StringCchCopyW(latestVersion, ARRAYSIZE(latestVersion),
+                   context->latestVersion);
+    HeapFree(GetProcessHeap(), 0, context);
 
     if (GetTempPathW(ARRAYSIZE(tempPath), tempPath) == 0 ||
         FAILED(StringCchPrintfW(updatePath, ARRAYSIZE(updatePath),
-                                L"%scMemo-update-%S.exe",
+                                L"%scMemo-update-%s.exe",
                                 tempPath,
                                 latestVersion))) {
+        if (IsWindow(hwnd)) {
+            PostMessageW(hwnd, WMAPP_UPDATE_DOWNLOAD_FAILED, 0, 0);
+        }
+        InterlockedExchange(&g_updateDownloadInProgress, 0);
         return 0;
     }
 
-    if (!DownloadUrlToFile(downloadUrlW, updatePath, 64 * 1024 * 1024) ||
+    if (!DownloadUrlToFile(downloadUrl, updatePath, 64 * 1024 * 1024) ||
         !IsDownloadedUpdateExecutable(updatePath)) {
         DeleteFileW(updatePath);
+        if (IsWindow(hwnd)) {
+            PostMessageW(hwnd, WMAPP_UPDATE_DOWNLOAD_FAILED, 0, 0);
+        }
+        InterlockedExchange(&g_updateDownloadInProgress, 0);
         return 0;
     }
 
     StringCchCopyW(g_pendingUpdatePath, ARRAYSIZE(g_pendingUpdatePath),
                    updatePath);
-    if (!Utf8ToWideString(latestVersion,
-                          g_pendingUpdateVersion,
-                          ARRAYSIZE(g_pendingUpdateVersion))) {
-        g_pendingUpdateVersion[0] = L'\0';
-    }
+    StringCchCopyW(g_pendingUpdateVersion, ARRAYSIZE(g_pendingUpdateVersion),
+                   latestVersion);
 
+    InterlockedExchange(&g_updateDownloadInProgress, 0);
     if (IsWindow(hwnd)) {
         PostMessageW(hwnd, WMAPP_UPDATE_READY, 0, 0);
     }
     return 0;
 }
 
-static void StartUpdateCheck(HWND hwnd)
+static void StartUpdateDownload(HWND hwnd)
 {
     HANDLE thread = NULL;
+    UpdateDownloadContext *context = NULL;
 
-    if (g_updateCheckStarted || !IsWindow(hwnd)) {
+    if (!IsWindow(hwnd)) {
         return;
     }
 
-    g_updateCheckStarted = TRUE;
-    thread = CreateThread(NULL, 0, UpdateCheckThreadProc, hwnd, 0, NULL);
+    if (InterlockedCompareExchange(&g_updateDownloadInProgress, 1, 0) != 0) {
+        MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_ALREADY_DOWNLOADING),
+                    APP_TITLE, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    context = (UpdateDownloadContext *)HeapAlloc(GetProcessHeap(),
+                                                 HEAP_ZERO_MEMORY,
+                                                 sizeof(*context));
+    if (!context) {
+        InterlockedExchange(&g_updateDownloadInProgress, 0);
+        MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_DOWNLOAD_FAILED),
+                    APP_TITLE, MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    context->hwnd = hwnd;
+    StringCchCopyW(context->downloadUrl, ARRAYSIZE(context->downloadUrl),
+                   g_availableUpdateUrl);
+    StringCchCopyW(context->latestVersion, ARRAYSIZE(context->latestVersion),
+                   g_availableUpdateVersion);
+
+    thread = CreateThread(NULL, 0, UpdateDownloadThreadProc, context, 0, NULL);
     if (thread) {
         CloseHandle(thread);
+    } else {
+        HeapFree(GetProcessHeap(), 0, context);
+        InterlockedExchange(&g_updateDownloadInProgress, 0);
+        MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_DOWNLOAD_FAILED),
+                    APP_TITLE, MB_OK | MB_ICONERROR);
+    }
+}
+
+static void StartUpdateCheck(HWND hwnd, BOOL manual)
+{
+    HANDLE thread = NULL;
+    UpdateCheckContext *context = NULL;
+    WCHAR message[256];
+
+    if (!IsWindow(hwnd)) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&g_updateCheckInProgress, 1, 0) != 0) {
+        if (manual) {
+            MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_ALREADY_CHECKING),
+                        APP_TITLE, MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
+
+    context = (UpdateCheckContext *)HeapAlloc(GetProcessHeap(),
+                                             HEAP_ZERO_MEMORY,
+                                             sizeof(*context));
+    if (!context) {
+        InterlockedExchange(&g_updateCheckInProgress, 0);
+        if (manual) {
+            if (SUCCEEDED(StringCchPrintfW(message, ARRAYSIZE(message),
+                                          UiText(UI_TEXT_UPDATE_CHECK_FAILED),
+                                          APP_VERSION_WIDE))) {
+                MessageBoxW(hwnd, message, APP_TITLE, MB_OK | MB_ICONERROR);
+            }
+        }
+        return;
+    }
+
+    context->hwnd = hwnd;
+    context->manual = manual;
+    thread = CreateThread(NULL, 0, UpdateCheckThreadProc, context, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+        if (manual &&
+            SUCCEEDED(StringCchPrintfW(message, ARRAYSIZE(message),
+                                      UiText(UI_TEXT_UPDATE_CHECKING),
+                                      APP_VERSION_WIDE))) {
+            MessageBoxW(hwnd, message, APP_TITLE, MB_OK | MB_ICONINFORMATION);
+        }
+    } else {
+        HeapFree(GetProcessHeap(), 0, context);
+        InterlockedExchange(&g_updateCheckInProgress, 0);
+        if (manual) {
+            if (SUCCEEDED(StringCchPrintfW(message, ARRAYSIZE(message),
+                                          UiText(UI_TEXT_UPDATE_CHECK_FAILED),
+                                          APP_VERSION_WIDE))) {
+                MessageBoxW(hwnd, message, APP_TITLE, MB_OK | MB_ICONERROR);
+            }
+        }
     }
 }
 
@@ -2781,6 +2997,12 @@ static void AddStartupMenuItems(HMENU menu)
                 IDM_TOGGLE_AUTOSTART, UiText(UI_TEXT_START_WITH_WINDOWS));
 }
 
+static void AddHelpMenuItems(HMENU menu)
+{
+    AppendMenuW(menu, MF_STRING, IDM_VERSION_CHECK,
+                UiText(UI_TEXT_VERSION_CHECK));
+}
+
 static void AppendItemsAsSubMenu(HMENU menu, UiTextId labelId,
                                  void (*addItems)(HMENU))
 {
@@ -2818,6 +3040,7 @@ static void ShowContextMenu(HWND owner, int x, int y)
     AppendItemsAsSubMenu(menu, UI_TEXT_ICON_SCROLL_MENU,
                          AddIconMarqueeMenuItems);
     AppendItemsAsSubMenu(menu, UI_TEXT_STARTUP_MENU, AddStartupMenuItems);
+    AppendItemsAsSubMenu(menu, UI_TEXT_HELP_MENU, AddHelpMenuItems);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_SAVE, UiText(UI_TEXT_SAVE));
     AppendMenuW(menu, MF_STRING, IDM_EXIT, UiText(UI_TEXT_EXIT));
@@ -2856,6 +3079,7 @@ static void ShowTrayMenu(HWND owner)
     AppendItemsAsSubMenu(menu, UI_TEXT_ICON_SCROLL_MENU,
                          AddIconMarqueeMenuItems);
     AppendItemsAsSubMenu(menu, UI_TEXT_STARTUP_MENU, AddStartupMenuItems);
+    AppendItemsAsSubMenu(menu, UI_TEXT_HELP_MENU, AddHelpMenuItems);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_SAVE, UiText(UI_TEXT_SAVE));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -3038,6 +3262,9 @@ static void HandleCommand(HWND hwnd, int commandId)
         }
         break;
     }
+    case IDM_VERSION_CHECK:
+        StartUpdateCheck(hwnd, TRUE);
+        break;
     default:
         break;
     }
@@ -3121,8 +3348,66 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         return 0;
     }
 
+    if (message == WMAPP_UPDATE_AVAILABLE) {
+        WCHAR updateMessage[512];
+        if (FAILED(StringCchPrintfW(updateMessage,
+                                    ARRAYSIZE(updateMessage),
+                                    UiText(UI_TEXT_UPDATE_AVAILABLE_PROMPT),
+                                    APP_VERSION_WIDE,
+                                    g_availableUpdateVersion))) {
+            StringCchCopyW(updateMessage, ARRAYSIZE(updateMessage),
+                           UiText(UI_TEXT_UPDATE_DOWNLOAD_FAILED));
+        }
+        if (MessageBoxW(hwnd,
+                        updateMessage,
+                        APP_TITLE,
+                        MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            StartUpdateDownload(hwnd);
+        }
+        return 0;
+    }
+
+    if (message == WMAPP_UPDATE_NOT_AVAILABLE) {
+        WCHAR updateMessage[512];
+        if (FAILED(StringCchPrintfW(updateMessage,
+                                    ARRAYSIZE(updateMessage),
+                                    UiText(UI_TEXT_UPDATE_NOT_AVAILABLE),
+                                    APP_VERSION_WIDE,
+                                    g_availableUpdateVersion))) {
+            StringCchCopyW(updateMessage, ARRAYSIZE(updateMessage),
+                           APP_VERSION_WIDE);
+        }
+        MessageBoxW(hwnd, updateMessage, APP_TITLE,
+                    MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
+
+    if (message == WMAPP_UPDATE_CHECK_FAILED) {
+        WCHAR updateMessage[512];
+        if (FAILED(StringCchPrintfW(updateMessage,
+                                    ARRAYSIZE(updateMessage),
+                                    UiText(UI_TEXT_UPDATE_CHECK_FAILED),
+                                    APP_VERSION_WIDE))) {
+            StringCchCopyW(updateMessage, ARRAYSIZE(updateMessage),
+                           UiText(UI_TEXT_UPDATE_CHECK_FAILED));
+        }
+        MessageBoxW(hwnd, updateMessage, APP_TITLE, MB_OK | MB_ICONERROR);
+        return 0;
+    }
+
     if (message == WMAPP_UPDATE_READY) {
-        LaunchUpdaterAndExit(hwnd);
+        MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_RESTARTING), APP_TITLE,
+                    MB_OK | MB_ICONINFORMATION);
+        if (!LaunchUpdaterAndExit(hwnd)) {
+            MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_DOWNLOAD_FAILED),
+                        APP_TITLE, MB_OK | MB_ICONERROR);
+        }
+        return 0;
+    }
+
+    if (message == WMAPP_UPDATE_DOWNLOAD_FAILED) {
+        MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_DOWNLOAD_FAILED),
+                    APP_TITLE, MB_OK | MB_ICONERROR);
         return 0;
     }
 
@@ -3152,7 +3437,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (g_settings.iconMarquee) {
             StartIconMarquee(hwnd);
         }
-        StartUpdateCheck(hwnd);
+        StartUpdateCheck(hwnd, FALSE);
         return 0;
 
     case WM_SIZE:

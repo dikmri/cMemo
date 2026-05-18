@@ -32,6 +32,8 @@ git push origin v1.0.1
 `vX.Y.Z` 形式のタグを push すると GitHub Actions が起動し、MinGW-w64 で `dist/cMemo.exe` をビルドします。
 ビルド後、`cMemo-vX.Y.Z.zip` と `cMemo-vX.Y.Z.exe` を作成して GitHub Release に添付します。
 自動更新機能は GitHub Release の `cMemo-vX.Y.Z.exe` を参照するため、タグと `APP_VERSION_STRING` は必ず一致させます。
+Release notes には、前回タグからの変更点を箇条書きで記載します。
+バージョン番号だけを更新するコミットは変更点から除外します。
 
 ## Codex 運用ルール
 
@@ -45,5 +47,6 @@ git push origin v1.0.1
 6. `main` に push します。
 7. 新しい `vX.Y.Z` タグを作成して push します。
 8. GitHub Actions の Release 作成結果を確認します。
+9. Release notes に前回バージョンからの変更点が箇条書きで入っていることを確認します。
 
 特に指定がない場合、バグ修正や小さな改善は patch version を上げます。

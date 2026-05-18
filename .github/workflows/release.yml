@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install MinGW-w64
         run: |
@@ -38,6 +40,25 @@ jobs:
           cp dist/cMemo.exe "cMemo-${GITHUB_REF_NAME}.exe"
           (cd release && zip "../cMemo-${GITHUB_REF_NAME}.zip" cMemo.exe)
 
+      - name: Generate release notes
+        shell: bash
+        run: |
+          PREVIOUS_TAG="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -n "${PREVIOUS_TAG}" ]; then
+            RANGE="${PREVIOUS_TAG}..${GITHUB_REF_NAME}"
+            echo "前回バージョン（${PREVIOUS_TAG}）からの変更点です。" > release-notes.md
+          else
+            RANGE="${GITHUB_REF_NAME}"
+            echo "初回リリースの変更点です。" > release-notes.md
+          fi
+          echo "" >> release-notes.md
+          CHANGES="$(git log --pretty=format:'- %s' "${RANGE}" | grep -vE '^- バージョンを[0-9]+\.[0-9]+\.[0-9]+に更新$' || true)"
+          if [ -z "${CHANGES}" ]; then
+            echo "- 変更なし" >> release-notes.md
+          else
+            echo "${CHANGES}" >> release-notes.md
+          fi
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -47,4 +68,4 @@ jobs:
             "cMemo-${GITHUB_REF_NAME}.exe" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "cMemo ${GITHUB_REF_NAME}" \
-            --notes "cMemo ${GITHUB_REF_NAME} のリリースです。"
+            --notes-file release-notes.md

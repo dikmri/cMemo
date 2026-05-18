@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "logger.h"
 #include "resource.h"
 #include "settings.h"
 
@@ -39,8 +40,10 @@
 #define EDIT_SCROLLBAR_MIN_THUMB_HEIGHT 24
 #define IDT_ICON_MARQUEE 50001
 #define IDT_SAVE_NOTIFICATION 50002
+#define IDT_LOG_HEARTBEAT 50003
 #define ICON_MARQUEE_INTERVAL_MS 160
 #define SAVE_NOTIFICATION_MS 1500
+#define LOG_HEARTBEAT_MS 5000
 #define ICON_MARQUEE_TEXT_MAX_CHARS 512
 
 #define IDM_TOPMOST_ON 40001
@@ -66,6 +69,7 @@
 #define IDM_EDITOR_BACKGROUND_COLOR 40022
 #define IDM_TOGGLE_ICON_MARQUEE_REVERSE 40023
 #define IDM_VERSION_CHECK 40024
+#define IDM_OPEN_LOG_FOLDER 40025
 #define IDM_FONT_SIZE_6 40030
 #define IDM_FONT_SIZE_7 40031
 #define IDM_FONT_SIZE_8 40032
@@ -163,6 +167,8 @@ typedef enum UiTextId {
     UI_TEXT_SHOW,
     UI_TEXT_HELP_MENU,
     UI_TEXT_VERSION_CHECK,
+    UI_TEXT_OPEN_LOG_FOLDER,
+    UI_TEXT_OPEN_LOG_FOLDER_ERROR,
     UI_TEXT_UPDATE_ALREADY_CHECKING,
     UI_TEXT_UPDATE_ALREADY_DOWNLOADING,
     UI_TEXT_UPDATE_AVAILABLE_PROMPT,
@@ -305,6 +311,14 @@ static const UiTextEntry g_uiTexts[UI_TEXT_COUNT] = {
     [UI_TEXT_VERSION_CHECK] = {
         L"Version / Check for Updates...",
         L"バージョン / 更新の確認..."
+    },
+    [UI_TEXT_OPEN_LOG_FOLDER] = {
+        L"Open Log Folder",
+        L"ログフォルダを開く"
+    },
+    [UI_TEXT_OPEN_LOG_FOLDER_ERROR] = {
+        L"Failed to open the log folder.",
+        L"ログフォルダを開けませんでした。"
     },
     [UI_TEXT_UPDATE_ALREADY_CHECKING] = {
         L"An update check is already running.",
@@ -1262,7 +1276,9 @@ static BOOL DownloadUrlToFile(LPCWSTR url, LPCWSTR path, DWORD maxBytes)
     DWORD written = 0;
     BOOL ok = FALSE;
 
+    LogInfo(L"Downloading update asset. target=%s", path);
     if (!ReadUrlToMemory(url, &data, &dataSize, maxBytes)) {
+        LogWarn(L"Failed to read update URL.");
         return FALSE;
     }
 
@@ -1274,11 +1290,17 @@ static BOOL DownloadUrlToFile(LPCWSTR url, LPCWSTR path, DWORD maxBytes)
                        FILE_ATTRIBUTE_NORMAL,
                        NULL);
     if (file == INVALID_HANDLE_VALUE) {
+        LogLastError(L"Create update file");
         goto cleanup;
     }
 
     ok = WriteFile(file, data, dataSize, &written, NULL) &&
          written == dataSize;
+    if (!ok) {
+        LogLastError(L"Write update file");
+    } else {
+        LogInfo(L"Downloaded update asset. bytes=%lu", dataSize);
+    }
 
 cleanup:
     if (file != INVALID_HANDLE_VALUE) {
@@ -1629,11 +1651,13 @@ static BOOL LaunchUpdaterAndExit(HWND hwnd)
     PROCESS_INFORMATION processInfo;
 
     if (GetModuleFileNameW(NULL, modulePath, ARRAYSIZE(modulePath)) == 0) {
+        LogLastError(L"GetModuleFileName for updater");
         return FALSE;
     }
 
     if (!WriteUpdaterScript(g_pendingUpdatePath, modulePath,
                             scriptPath, ARRAYSIZE(scriptPath))) {
+        LogError(L"Failed to write updater script.");
         return FALSE;
     }
 
@@ -1660,10 +1684,15 @@ static BOOL LaunchUpdaterAndExit(HWND hwnd)
                         NULL,
                         &startupInfo,
                         &processInfo)) {
+        LogLastError(L"Create updater process");
         DeleteFileW(scriptPath);
         return FALSE;
     }
 
+    LogInfo(L"Updater launched. version=%s update=%s target=%s",
+            g_pendingUpdateVersion,
+            g_pendingUpdatePath,
+            modulePath);
     CloseHandle(processInfo.hThread);
     CloseHandle(processInfo.hProcess);
     g_isExiting = TRUE;
@@ -1706,6 +1735,7 @@ static DWORD WINAPI UpdateCheckThreadProc(LPVOID parameter)
                          &jsonBytes,
                          &jsonSize,
                          1024 * 1024)) {
+        LogWarn(L"Update check failed while reading latest release.");
         if (manual && IsWindow(hwnd)) {
             PostMessageW(hwnd, WMAPP_UPDATE_CHECK_FAILED, 0, 0);
         }
@@ -1721,6 +1751,7 @@ static DWORD WINAPI UpdateCheckThreadProc(LPVOID parameter)
                                    downloadUrl,
                                    sizeof(downloadUrl))) {
         HeapFree(GetProcessHeap(), 0, jsonBytes);
+        LogWarn(L"Update check failed while parsing latest release.");
         if (manual && IsWindow(hwnd)) {
             PostMessageW(hwnd, WMAPP_UPDATE_CHECK_FAILED, 0, 0);
         }
@@ -1731,6 +1762,9 @@ static DWORD WINAPI UpdateCheckThreadProc(LPVOID parameter)
 
     NormalizeVersionString(latestTag, latestVersion, sizeof(latestVersion));
     if (CompareVersionStrings(latestVersion, APP_VERSION_STRING) <= 0) {
+        LogInfo(L"Update check completed. current=%S latest=%S update=none",
+                APP_VERSION_STRING,
+                latestVersion);
         if (Utf8ToWideString(latestVersion,
                              g_availableUpdateVersion,
                              ARRAYSIZE(g_availableUpdateVersion)) &&
@@ -1743,6 +1777,7 @@ static DWORD WINAPI UpdateCheckThreadProc(LPVOID parameter)
 
     if (!Utf8ToWideString(downloadUrl, downloadUrlW,
                           ARRAYSIZE(downloadUrlW))) {
+        LogWarn(L"Update check failed while converting download URL.");
         if (manual && IsWindow(hwnd)) {
             PostMessageW(hwnd, WMAPP_UPDATE_CHECK_FAILED, 0, 0);
         }
@@ -1759,6 +1794,10 @@ static DWORD WINAPI UpdateCheckThreadProc(LPVOID parameter)
     }
 
     InterlockedExchange(&g_updateCheckInProgress, 0);
+    LogInfo(L"Update available. current=%S latest=%s manual=%d",
+            APP_VERSION_STRING,
+            g_availableUpdateVersion,
+            manual);
     if (IsWindow(hwnd)) {
         PostMessageW(hwnd, WMAPP_UPDATE_AVAILABLE, manual ? 1 : 0, 0);
     }
@@ -1790,6 +1829,7 @@ static DWORD WINAPI UpdateDownloadThreadProc(LPVOID parameter)
                                 L"%scMemo-update-%s.exe",
                                 tempPath,
                                 latestVersion))) {
+        LogWarn(L"Failed to build temporary update path.");
         if (manual && IsWindow(hwnd)) {
             PostMessageW(hwnd, WMAPP_UPDATE_DOWNLOAD_FAILED, 1, 0);
         }
@@ -1799,6 +1839,8 @@ static DWORD WINAPI UpdateDownloadThreadProc(LPVOID parameter)
 
     if (!DownloadUrlToFile(downloadUrl, updatePath, 64 * 1024 * 1024) ||
         !IsDownloadedUpdateExecutable(updatePath)) {
+        LogWarn(L"Update download or validation failed. version=%s",
+                latestVersion);
         DeleteFileW(updatePath);
         if (manual && IsWindow(hwnd)) {
             PostMessageW(hwnd, WMAPP_UPDATE_DOWNLOAD_FAILED, 1, 0);
@@ -1813,6 +1855,9 @@ static DWORD WINAPI UpdateDownloadThreadProc(LPVOID parameter)
                    latestVersion);
 
     InterlockedExchange(&g_updateDownloadInProgress, 0);
+    LogInfo(L"Update downloaded and validated. version=%s path=%s",
+            latestVersion,
+            updatePath);
     if (IsWindow(hwnd)) {
         PostMessageW(hwnd, WMAPP_UPDATE_READY, manual ? 1 : 0, 0);
     }
@@ -1829,6 +1874,7 @@ static void StartUpdateDownload(HWND hwnd, BOOL manual)
     }
 
     if (InterlockedCompareExchange(&g_updateDownloadInProgress, 1, 0) != 0) {
+        LogInfo(L"Update download skipped because another download is running.");
         if (manual) {
             MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_ALREADY_DOWNLOADING),
                         APP_TITLE, MB_OK | MB_ICONINFORMATION);
@@ -1841,6 +1887,7 @@ static void StartUpdateDownload(HWND hwnd, BOOL manual)
                                                  sizeof(*context));
     if (!context) {
         InterlockedExchange(&g_updateDownloadInProgress, 0);
+        LogError(L"Failed to allocate update download context.");
         if (manual) {
             MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_DOWNLOAD_FAILED),
                         APP_TITLE, MB_OK | MB_ICONERROR);
@@ -1858,9 +1905,13 @@ static void StartUpdateDownload(HWND hwnd, BOOL manual)
     thread = CreateThread(NULL, 0, UpdateDownloadThreadProc, context, 0, NULL);
     if (thread) {
         CloseHandle(thread);
+        LogInfo(L"Update download started. version=%s manual=%d",
+                g_availableUpdateVersion,
+                manual);
     } else {
         HeapFree(GetProcessHeap(), 0, context);
         InterlockedExchange(&g_updateDownloadInProgress, 0);
+        LogLastError(L"Create update download thread");
         if (manual) {
             MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_DOWNLOAD_FAILED),
                         APP_TITLE, MB_OK | MB_ICONERROR);
@@ -1879,6 +1930,7 @@ static void StartUpdateCheck(HWND hwnd, BOOL manual)
     }
 
     if (InterlockedCompareExchange(&g_updateCheckInProgress, 1, 0) != 0) {
+        LogInfo(L"Update check skipped because another check is running.");
         if (manual) {
             MessageBoxW(hwnd, UiText(UI_TEXT_UPDATE_ALREADY_CHECKING),
                         APP_TITLE, MB_OK | MB_ICONINFORMATION);
@@ -1891,6 +1943,7 @@ static void StartUpdateCheck(HWND hwnd, BOOL manual)
                                              sizeof(*context));
     if (!context) {
         InterlockedExchange(&g_updateCheckInProgress, 0);
+        LogError(L"Failed to allocate update check context.");
         if (manual) {
             if (SUCCEEDED(StringCchPrintfW(message, ARRAYSIZE(message),
                                           UiText(UI_TEXT_UPDATE_CHECK_FAILED),
@@ -1906,9 +1959,11 @@ static void StartUpdateCheck(HWND hwnd, BOOL manual)
     thread = CreateThread(NULL, 0, UpdateCheckThreadProc, context, 0, NULL);
     if (thread) {
         CloseHandle(thread);
+        LogInfo(L"Update check started. manual=%d", manual);
     } else {
         HeapFree(GetProcessHeap(), 0, context);
         InterlockedExchange(&g_updateCheckInProgress, 0);
+        LogLastError(L"Create update check thread");
         if (manual) {
             if (SUCCEEDED(StringCchPrintfW(message, ARRAYSIZE(message),
                                           UiText(UI_TEXT_UPDATE_CHECK_FAILED),
@@ -1949,6 +2004,7 @@ static BOOL SetAutoStartEnabled(BOOL enabled)
         WCHAR command[1024];
 
         if (!GetRunCommand(command, ARRAYSIZE(command))) {
+            LogError(L"Failed to build auto start command.");
             return FALSE;
         }
 
@@ -1956,6 +2012,8 @@ static BOOL SetAutoStartEnabled(BOOL enabled)
                                  REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
                                  NULL, &key, NULL);
         if (result != ERROR_SUCCESS) {
+            LogWarn(L"Failed to open auto start registry key. result=%ld",
+                    result);
             return FALSE;
         }
 
@@ -1964,20 +2022,33 @@ static BOOL SetAutoStartEnabled(BOOL enabled)
                                 (DWORD)((lstrlenW(command) + 1) *
                                         sizeof(WCHAR)));
         RegCloseKey(key);
+        if (result == ERROR_SUCCESS) {
+            LogInfo(L"Auto start enabled.");
+        } else {
+            LogWarn(L"Failed to enable auto start. result=%ld", result);
+        }
         return result == ERROR_SUCCESS;
     }
 
     result = RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY_PATH, 0,
                            KEY_SET_VALUE, &key);
     if (result == ERROR_FILE_NOT_FOUND) {
+        LogInfo(L"Auto start registry key was not found while disabling.");
         return TRUE;
     }
     if (result != ERROR_SUCCESS) {
+        LogWarn(L"Failed to open auto start registry key for delete. result=%ld",
+                result);
         return FALSE;
     }
 
     result = RegDeleteValueW(key, RUN_VALUE_NAME);
     RegCloseKey(key);
+    if (result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND) {
+        LogInfo(L"Auto start disabled.");
+    } else {
+        LogWarn(L"Failed to disable auto start. result=%ld", result);
+    }
     return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
 }
 
@@ -2457,7 +2528,17 @@ static BOOL SaveCurrentState(HWND hwnd)
         g_settings.height = DEFAULT_WINDOW_HEIGHT;
     }
 
-    return SaveSettings(&g_settings);
+    if (SaveSettings(&g_settings)) {
+        LogInfo(L"Settings saved. memoChars=%d width=%d height=%d mode=%d",
+                lstrlenW(g_settings.memoText),
+                g_settings.width,
+                g_settings.height,
+                (int)g_settings.displayMode);
+        return TRUE;
+    }
+
+    LogError(L"Failed to save settings.");
+    return FALSE;
 }
 
 static void ShowSaveNotification(HWND hwnd)
@@ -2737,6 +2818,7 @@ static BOOL SetTrayIcon(HWND hwnd, HICON icon)
             g_trayIconAdded = TRUE;
             return TRUE;
         }
+        LogLastError(L"Shell_NotifyIcon");
         return FALSE;
     }
 
@@ -2864,12 +2946,14 @@ static void ShowMainWindow(HWND hwnd)
 
 static void HideMainWindow(HWND hwnd)
 {
+    LogInfo(L"Main window hidden.");
     SaveCurrentState(hwnd);
     ShowWindow(hwnd, SW_HIDE);
 }
 
 static void ExitApplication(HWND hwnd)
 {
+    LogInfo(L"Exit requested.");
     g_isExiting = TRUE;
     SaveCurrentState(hwnd);
     DestroyWindow(hwnd);
@@ -2999,6 +3083,8 @@ static void AddHelpMenuItems(HMENU menu)
 {
     AppendMenuW(menu, MF_STRING, IDM_VERSION_CHECK,
                 UiText(UI_TEXT_VERSION_CHECK));
+    AppendMenuW(menu, MF_STRING, IDM_OPEN_LOG_FOLDER,
+                UiText(UI_TEXT_OPEN_LOG_FOLDER));
 }
 
 static void AppendItemsAsSubMenu(HMENU menu, UiTextId labelId,
@@ -3125,6 +3211,7 @@ static ATOM RegisterMainWindowClass(HINSTANCE instance)
 
 static void HandleCommand(HWND hwnd, int commandId)
 {
+    LogInfo(L"Command received. id=%d", commandId);
     switch (commandId) {
     case IDM_TOPMOST_ON:
         ApplyDisplayMode(hwnd, DISPLAY_MODE_TOPMOST);
@@ -3262,6 +3349,15 @@ static void HandleCommand(HWND hwnd, int commandId)
     }
     case IDM_VERSION_CHECK:
         StartUpdateCheck(hwnd, TRUE);
+        break;
+    case IDM_OPEN_LOG_FOLDER:
+        if (!LogOpenFolder(hwnd)) {
+            LogWarn(L"Failed to open log folder from menu.");
+            MessageBoxW(hwnd,
+                        UiText(UI_TEXT_OPEN_LOG_FOLDER_ERROR),
+                        APP_TITLE,
+                        MB_OK | MB_ICONERROR);
+        }
         break;
     default:
         break;
@@ -3438,6 +3534,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     case WM_CREATE:
         g_mainWindow = hwnd;
         if (!CreateEditControl(hwnd)) {
+            LogError(L"Failed to create edit control.");
             return -1;
         }
         AddTrayIcon(hwnd);
@@ -3448,6 +3545,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (g_settings.iconMarquee) {
             StartIconMarquee(hwnd);
         }
+        SetTimer(hwnd, IDT_LOG_HEARTBEAT, LOG_HEARTBEAT_MS, NULL);
+        LogInfo(L"Main window created.");
         StartUpdateCheck(hwnd, FALSE);
         return 0;
 
@@ -3592,6 +3691,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             FinishSaveNotification(hwnd);
             return 0;
         }
+        if (wParam == IDT_LOG_HEARTBEAT) {
+            LogHeartbeat();
+            return 0;
+        }
         break;
 
     case WM_CTLCOLOREDIT:
@@ -3671,12 +3774,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         return 0;
 
     case WM_QUERYENDSESSION:
+        LogInfo(L"WM_QUERYENDSESSION received.");
         SaveCurrentState(hwnd);
         return TRUE;
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_ICON_MARQUEE);
         KillTimer(hwnd, IDT_SAVE_NOTIFICATION);
+        KillTimer(hwnd, IDT_LOG_HEARTBEAT);
         RemoveTrayIcon(hwnd);
         DestroyMarqueeIcons();
         if (g_editFont) {
@@ -3709,18 +3814,28 @@ int WINAPI wWinMain(HINSTANCE instance,
     UNREFERENCED_PARAMETER(previousInstance);
     UNREFERENCED_PARAMETER(commandLine);
 
+    LogInitialize();
+    SetUnhandledExceptionFilter(LogUnhandledExceptionFilter);
+    LogInfo(L"Application starting. version=%s", APP_VERSION_WIDE);
+
     g_instance = instance;
     InitUiLanguage();
     g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 
-    LoadSettings(&g_settings);
+    if (LoadSettings(&g_settings)) {
+        LogInfo(L"Settings loaded.");
+    } else {
+        LogWarn(L"Settings could not be loaded. Defaults are used.");
+    }
     g_settings.autoStart = IsAutoStartEnabled();
 
     if (!RegisterMainWindowClass(instance)) {
+        LogLastError(L"Register main window class");
         MessageBoxW(NULL,
                     UiText(UI_TEXT_REGISTER_CLASS_ERROR),
                     APP_TITLE,
                     MB_ICONERROR);
+        LogShutdown();
         return 1;
     }
 
@@ -3738,10 +3853,12 @@ int WINAPI wWinMain(HINSTANCE instance,
                            NULL);
 
     if (!hwnd) {
+        LogLastError(L"Create main window");
         MessageBoxW(NULL,
                     UiText(UI_TEXT_CREATE_WINDOW_ERROR),
                     APP_TITLE,
                     MB_ICONERROR);
+        LogShutdown();
         return 1;
     }
 
@@ -3753,5 +3870,7 @@ int WINAPI wWinMain(HINSTANCE instance,
         DispatchMessageW(&message);
     }
 
+    LogInfo(L"Application exiting. code=%d", (int)message.wParam);
+    LogShutdown();
     return (int)message.wParam;
 }

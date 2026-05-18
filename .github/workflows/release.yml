@@ -26,9 +26,9 @@ jobs:
         run: |
           mkdir -p dist
           x86_64-w64-mingw32-windres src/app.rc -O coff -o dist/app.res
-          x86_64-w64-mingw32-gcc src/main.c src/settings.c dist/app.res \
+          x86_64-w64-mingw32-gcc src/main.c src/settings.c src/logger.c dist/app.res \
             -municode -mwindows \
-            -lcomdlg32 -ldwmapi -lshell32 -lgdi32 -lwininet \
+            -lcomdlg32 -ldwmapi -lshell32 -lgdi32 -lwininet -ldbghelp \
             -o dist/cMemo.exe
 
       - name: Package

@@ -6,5 +6,7 @@
 *.ilk
 *.log
 
+dist/
+
 .vs/
 .vscode/

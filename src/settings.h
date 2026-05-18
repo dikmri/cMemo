@@ -18,6 +18,7 @@
 #define DEFAULT_FONT_POINT_SIZE 10
 #define MIN_FONT_POINT_SIZE 6
 #define MAX_FONT_POINT_SIZE 72
+#define DEFAULT_EDITOR_BACKGROUND_COLOR RGB(255, 255, 255)
 #define DEFAULT_BORDER_COLOR RGB(80, 120, 200)
 #define DEFAULT_TITLE_HOVER_ONLY TRUE
 #define DEFAULT_ICON_MARQUEE FALSE
@@ -46,6 +47,7 @@ typedef struct AppSettings {
     int fontPointSize;
     int fontWeight;
     BOOL fontItalic;
+    COLORREF editorBackgroundColor;
     COLORREF borderColor;
     BOOL titleHoverOnly;
     BOOL iconMarquee;

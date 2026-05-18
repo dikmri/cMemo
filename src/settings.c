@@ -32,6 +32,7 @@
 #define KEY_FONT_POINT_SIZE L"FontPointSize"
 #define KEY_FONT_WEIGHT L"FontWeight"
 #define KEY_FONT_ITALIC L"FontItalic"
+#define KEY_EDITOR_BACKGROUND_COLOR L"EditorBackgroundColor"
 #define KEY_BORDER_COLOR L"BorderColor"
 #define KEY_TITLE_HOVER_ONLY L"TitleHoverOnly"
 #define KEY_ICON_MARQUEE L"IconMarquee"
@@ -132,6 +133,7 @@ void InitDefaultSettings(AppSettings *settings)
     settings->fontPointSize = DEFAULT_FONT_POINT_SIZE;
     settings->fontWeight = FW_NORMAL;
     settings->fontItalic = FALSE;
+    settings->editorBackgroundColor = DEFAULT_EDITOR_BACKGROUND_COLOR;
     settings->borderColor = DEFAULT_BORDER_COLOR;
     settings->titleHoverOnly = DEFAULT_TITLE_HOVER_ONLY;
     settings->iconMarquee = DEFAULT_ICON_MARQUEE;
@@ -340,6 +342,9 @@ BOOL LoadSettings(AppSettings *settings)
                                                  KEY_FONT_ITALIC,
                                                  settings->fontItalic,
                                                  path) != 0;
+    settings->editorBackgroundColor = (COLORREF)GetPrivateProfileIntW(
+        SECTION_APPEARANCE, KEY_EDITOR_BACKGROUND_COLOR,
+        (int)settings->editorBackgroundColor, path);
     settings->borderColor = (COLORREF)GetPrivateProfileIntW(
         SECTION_APPEARANCE, KEY_BORDER_COLOR, (int)settings->borderColor, path);
     settings->titleHoverOnly = GetPrivateProfileIntW(
@@ -438,6 +443,9 @@ BOOL SaveSettings(const AppSettings *settings)
                              settings->fontWeight);
     ok = ok && WriteIntValue(path, SECTION_APPEARANCE, KEY_FONT_ITALIC,
                              settings->fontItalic ? 1 : 0);
+    ok = ok && WriteIntValue(path, SECTION_APPEARANCE,
+                             KEY_EDITOR_BACKGROUND_COLOR,
+                             (int)settings->editorBackgroundColor);
     ok = ok && WriteIntValue(path, SECTION_APPEARANCE, KEY_BORDER_COLOR,
                              (int)settings->borderColor);
     ok = ok && WriteIntValue(path, SECTION_APPEARANCE, KEY_TITLE_HOVER_ONLY,

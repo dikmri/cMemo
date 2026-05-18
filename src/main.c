@@ -29,7 +29,9 @@
 #define TITLE_TEXT_LEFT_PADDING 10
 #define RESIZE_HIT_THICKNESS 8
 #define IDT_ICON_MARQUEE 50001
+#define IDT_SAVE_NOTIFICATION 50002
 #define ICON_MARQUEE_INTERVAL_MS 160
+#define SAVE_NOTIFICATION_MS 1500
 #define ICON_MARQUEE_TEXT_MAX_CHARS 512
 
 #define IDM_TOPMOST_ON 40001
@@ -52,6 +54,7 @@
 #define IDM_ICON_MARQUEE_SPEED_FAST 40019
 #define IDM_ICON_MARQUEE_SPEED_FASTEST 40020
 #define IDM_ICON_MARQUEE_BACKGROUND_COLOR 40021
+#define IDM_EDITOR_BACKGROUND_COLOR 40022
 
 #define TRAY_ICON_UID 1
 #define WMAPP_TRAYICON (WM_APP + 1)
@@ -67,8 +70,10 @@ static HWND g_mainWindow = NULL;
 static HWND g_editWindow = NULL;
 static WNDPROC g_originalEditProc = NULL;
 static HFONT g_editFont = NULL;
+static HBRUSH g_editBackgroundBrush = NULL;
 static AppSettings g_settings;
 static BOOL g_isExiting = FALSE;
+static BOOL g_showSaveNotification = FALSE;
 static BOOL g_trayIconAdded = FALSE;
 static BOOL g_titleHovered = TRUE;
 static BOOL g_clientMouseTracking = FALSE;
@@ -91,9 +96,13 @@ typedef enum UiTextId {
     UI_TEXT_REMOVE_ALWAYS_ON_TOP,
     UI_TEXT_DESKTOP_MODE,
     UI_TEXT_NORMAL_DISPLAY,
+    UI_TEXT_DISPLAY_MENU,
+    UI_TEXT_APPEARANCE_MENU,
     UI_TEXT_FONT,
+    UI_TEXT_EDITOR_BACKGROUND_COLOR,
     UI_TEXT_WINDOW_COLOR,
     UI_TEXT_SHOW_TITLE_ON_HOVER_ONLY,
+    UI_TEXT_ICON_SCROLL_MENU,
     UI_TEXT_SCROLL_MEMO_ON_ICON,
     UI_TEXT_ICON_TEXT_COLOR,
     UI_TEXT_ICON_BACKGROUND_COLOR,
@@ -104,7 +113,10 @@ typedef enum UiTextId {
     UI_TEXT_SPEED_FAST,
     UI_TEXT_SPEED_FASTEST,
     UI_TEXT_START_WITH_WINDOWS,
+    UI_TEXT_STARTUP_MENU,
     UI_TEXT_SAVE,
+    UI_TEXT_SAVED,
+    UI_TEXT_SAVE_ERROR,
     UI_TEXT_EXIT,
     UI_TEXT_SHOW,
     UI_TEXT_STARTUP_SETTING_ERROR,
@@ -135,9 +147,21 @@ static const UiTextEntry g_uiTexts[UI_TEXT_COUNT] = {
         L"Normal Display",
         L"通常表示"
     },
+    [UI_TEXT_DISPLAY_MENU] = {
+        L"Display",
+        L"\u8868\u793A"
+    },
+    [UI_TEXT_APPEARANCE_MENU] = {
+        L"Appearance",
+        L"\u5916\u89B3"
+    },
     [UI_TEXT_FONT] = {
         L"Font...",
         L"フォント..."
+    },
+    [UI_TEXT_EDITOR_BACKGROUND_COLOR] = {
+        L"Editor Background Color...",
+        L"\u5165\u529B\u6B04\u80CC\u666F\u8272..."
     },
     [UI_TEXT_WINDOW_COLOR] = {
         L"Window Color...",
@@ -146,6 +170,10 @@ static const UiTextEntry g_uiTexts[UI_TEXT_COUNT] = {
     [UI_TEXT_SHOW_TITLE_ON_HOVER_ONLY] = {
         L"Show Title on Hover Only",
         L"マウスオーバー時のみタイトルを表示"
+    },
+    [UI_TEXT_ICON_SCROLL_MENU] = {
+        L"Icon Scroll",
+        L"\u30A2\u30A4\u30B3\u30F3\u30B9\u30AF\u30ED\u30FC\u30EB"
     },
     [UI_TEXT_SCROLL_MEMO_ON_ICON] = {
         L"Scroll Memo on Icon",
@@ -187,9 +215,21 @@ static const UiTextEntry g_uiTexts[UI_TEXT_COUNT] = {
         L"Start with Windows",
         L"Windows 起動時に開始"
     },
+    [UI_TEXT_STARTUP_MENU] = {
+        L"Startup",
+        L"\u8D77\u52D5"
+    },
     [UI_TEXT_SAVE] = {
         L"Save",
         L"保存"
+    },
+    [UI_TEXT_SAVED] = {
+        L"Saved.",
+        L"\u4FDD\u5B58\u3057\u307E\u3057\u305F\u3002"
+    },
+    [UI_TEXT_SAVE_ERROR] = {
+        L"Failed to save.",
+        L"\u4FDD\u5B58\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F\u3002"
     },
     [UI_TEXT_EXIT] = {
         L"Exit",
@@ -541,6 +581,7 @@ static void DrawCustomTitleBar(HWND hwnd, HDC hdc)
     RECT textRect;
     HBRUSH titleBrush = NULL;
     HICON icon = NULL;
+    LPCWSTR titleText = g_showSaveNotification ? UiText(UI_TEXT_SAVED) : APP_TITLE;
     COLORREF textColor = GetReadableTitleTextColor(g_settings.borderColor);
     int oldBkMode = 0;
     COLORREF oldTextColor = 0;
@@ -578,7 +619,7 @@ static void DrawCustomTitleBar(HWND hwnd, HDC hdc)
 
     oldBkMode = SetBkMode(hdc, TRANSPARENT);
     oldTextColor = SetTextColor(hdc, textColor);
-    DrawTextW(hdc, APP_TITLE, -1, &textRect,
+    DrawTextW(hdc, titleText, -1, &textRect,
               DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
     SetTextColor(hdc, oldTextColor);
     SetBkMode(hdc, oldBkMode);
@@ -733,6 +774,33 @@ static void ApplyEditorFont(void)
     }
 }
 
+static HBRUSH GetEditorBackgroundBrush(void)
+{
+    if (!g_editBackgroundBrush) {
+        g_editBackgroundBrush =
+            CreateSolidBrush(g_settings.editorBackgroundColor);
+    }
+
+    if (!g_editBackgroundBrush) {
+        return (HBRUSH)GetStockObject(WHITE_BRUSH);
+    }
+
+    return g_editBackgroundBrush;
+}
+
+static void ApplyEditorBackgroundColor(void)
+{
+    if (g_editBackgroundBrush) {
+        DeleteObject(g_editBackgroundBrush);
+        g_editBackgroundBrush = NULL;
+    }
+
+    g_editBackgroundBrush = CreateSolidBrush(g_settings.editorBackgroundColor);
+    if (g_editWindow) {
+        InvalidateRect(g_editWindow, NULL, TRUE);
+    }
+}
+
 static BOOL ChooseEditorFont(HWND owner)
 {
     CHOOSEFONTW chooseFont;
@@ -766,6 +834,27 @@ static BOOL ChooseEditorFont(HWND owner)
     g_settings.fontWeight = logFont.lfWeight;
     g_settings.fontItalic = logFont.lfItalic != 0;
     ApplyEditorFont();
+    return TRUE;
+}
+
+static BOOL ChooseEditorBackgroundColor(HWND owner)
+{
+    static COLORREF customColors[16];
+    CHOOSECOLORW chooseColor;
+
+    ZeroMemory(&chooseColor, sizeof(chooseColor));
+    chooseColor.lStructSize = sizeof(chooseColor);
+    chooseColor.hwndOwner = owner;
+    chooseColor.rgbResult = g_settings.editorBackgroundColor;
+    chooseColor.lpCustColors = customColors;
+    chooseColor.Flags = CC_FULLOPEN | CC_RGBINIT;
+
+    if (!ChooseColorW(&chooseColor)) {
+        return FALSE;
+    }
+
+    g_settings.editorBackgroundColor = chooseColor.rgbResult;
+    ApplyEditorBackgroundColor();
     return TRUE;
 }
 
@@ -1034,7 +1123,8 @@ static BOOL CreateEditControl(HWND hwnd)
         L"EDIT",
         L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL |
-            ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+            ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL |
+            ES_WANTRETURN | ES_NOHIDESEL,
         0,
         0,
         0,
@@ -1049,6 +1139,7 @@ static BOOL CreateEditControl(HWND hwnd)
     }
 
     ApplyEditorFont();
+    ApplyEditorBackgroundColor();
     SendMessageW(g_editWindow, EM_LIMITTEXT, MEMO_TEXT_MAX_CHARS - 1, 0);
     SetWindowTextW(g_editWindow, g_settings.memoText);
 
@@ -1059,7 +1150,7 @@ static BOOL CreateEditControl(HWND hwnd)
     return TRUE;
 }
 
-static void SaveCurrentState(HWND hwnd)
+static BOOL SaveCurrentState(HWND hwnd)
 {
     RECT windowRect;
 
@@ -1082,7 +1173,42 @@ static void SaveCurrentState(HWND hwnd)
         g_settings.height = DEFAULT_WINDOW_HEIGHT;
     }
 
-    SaveSettings(&g_settings);
+    return SaveSettings(&g_settings);
+}
+
+static void ShowSaveNotification(HWND hwnd)
+{
+    if (!IsWindow(hwnd)) {
+        return;
+    }
+
+    g_showSaveNotification = TRUE;
+    g_titleHovered = TRUE;
+    SetTimer(hwnd, IDT_SAVE_NOTIFICATION, SAVE_NOTIFICATION_MS, NULL);
+    ApplyTitleBarAppearance(hwnd);
+}
+
+static void FinishSaveNotification(HWND hwnd)
+{
+    KillTimer(hwnd, IDT_SAVE_NOTIFICATION);
+    g_showSaveNotification = FALSE;
+    if (g_settings.titleHoverOnly && !IsCursorOverWindow(hwnd)) {
+        g_titleHovered = FALSE;
+    }
+    ApplyTitleBarAppearance(hwnd);
+}
+
+static void SaveCurrentStateWithNotification(HWND hwnd)
+{
+    if (SaveCurrentState(hwnd)) {
+        if (IsWindowVisible(hwnd)) {
+            ShowSaveNotification(hwnd);
+        } else {
+            MessageBoxW(hwnd, UiText(UI_TEXT_SAVED), APP_TITLE, MB_OK);
+        }
+    } else {
+        MessageBoxW(hwnd, UiText(UI_TEXT_SAVE_ERROR), APP_TITLE, MB_ICONERROR);
+    }
 }
 
 static void DestroyMarqueeIcons(void)
@@ -1499,16 +1625,22 @@ static void AddIconMarqueeSpeedMenu(HMENU menu)
 
 static void AddAppearanceMenuItems(HMENU menu)
 {
-    UINT autoStartChecked = g_settings.autoStart ? MF_CHECKED : 0;
     UINT titleHoverChecked = g_settings.titleHoverOnly ? MF_CHECKED : 0;
-    UINT iconMarqueeChecked = g_settings.iconMarquee ? MF_CHECKED : 0;
 
     AppendMenuW(menu, MF_STRING, IDM_FONT, UiText(UI_TEXT_FONT));
+    AppendMenuW(menu, MF_STRING, IDM_EDITOR_BACKGROUND_COLOR,
+                UiText(UI_TEXT_EDITOR_BACKGROUND_COLOR));
     AppendMenuW(menu, MF_STRING, IDM_BORDER_COLOR,
                 UiText(UI_TEXT_WINDOW_COLOR));
     AppendMenuW(menu, MF_STRING | titleHoverChecked,
                 IDM_TOGGLE_TITLE_HOVER,
                 UiText(UI_TEXT_SHOW_TITLE_ON_HOVER_ONLY));
+}
+
+static void AddIconMarqueeMenuItems(HMENU menu)
+{
+    UINT iconMarqueeChecked = g_settings.iconMarquee ? MF_CHECKED : 0;
+
     AppendMenuW(menu, MF_STRING | iconMarqueeChecked,
                 IDM_TOGGLE_ICON_MARQUEE,
                 UiText(UI_TEXT_SCROLL_MEMO_ON_ICON));
@@ -1519,8 +1651,30 @@ static void AddAppearanceMenuItems(HMENU menu)
     AppendMenuW(menu, MF_STRING, IDM_ICON_MARQUEE_FONT,
                 UiText(UI_TEXT_ICON_FONT));
     AddIconMarqueeSpeedMenu(menu);
+}
+
+static void AddStartupMenuItems(HMENU menu)
+{
+    UINT autoStartChecked = g_settings.autoStart ? MF_CHECKED : 0;
+
     AppendMenuW(menu, MF_STRING | autoStartChecked,
                 IDM_TOGGLE_AUTOSTART, UiText(UI_TEXT_START_WITH_WINDOWS));
+}
+
+static void AppendItemsAsSubMenu(HMENU menu, UiTextId labelId,
+                                 void (*addItems)(HMENU))
+{
+    HMENU subMenu = CreatePopupMenu();
+
+    if (!subMenu) {
+        addItems(menu);
+        return;
+    }
+
+    addItems(subMenu);
+    if (!AppendMenuW(menu, MF_POPUP, (UINT_PTR)subMenu, UiText(labelId))) {
+        DestroyMenu(subMenu);
+    }
 }
 
 static void ShowContextMenu(HWND owner, int x, int y)
@@ -1539,9 +1693,11 @@ static void ShowContextMenu(HWND owner, int x, int y)
         y = point.y;
     }
 
-    AddDisplayMenuItems(menu);
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AddAppearanceMenuItems(menu);
+    AppendItemsAsSubMenu(menu, UI_TEXT_DISPLAY_MENU, AddDisplayMenuItems);
+    AppendItemsAsSubMenu(menu, UI_TEXT_APPEARANCE_MENU, AddAppearanceMenuItems);
+    AppendItemsAsSubMenu(menu, UI_TEXT_ICON_SCROLL_MENU,
+                         AddIconMarqueeMenuItems);
+    AppendItemsAsSubMenu(menu, UI_TEXT_STARTUP_MENU, AddStartupMenuItems);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_SAVE, UiText(UI_TEXT_SAVE));
     AppendMenuW(menu, MF_STRING, IDM_EXIT, UiText(UI_TEXT_EXIT));
@@ -1567,7 +1723,6 @@ static void ShowTrayMenu(HWND owner)
 {
     HMENU menu = CreatePopupMenu();
     POINT point;
-    UINT topmostChecked = g_settings.displayMode == DISPLAY_MODE_TOPMOST ? MF_CHECKED : 0;
     int command = 0;
 
     if (!menu) {
@@ -1576,10 +1731,11 @@ static void ShowTrayMenu(HWND owner)
 
     GetCursorPos(&point);
     AppendMenuW(menu, MF_STRING, IDM_SHOW, UiText(UI_TEXT_SHOW));
-    AppendMenuW(menu, MF_STRING | topmostChecked,
-                IDM_TOGGLE_TOPMOST, UiText(UI_TEXT_ALWAYS_ON_TOP));
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AddAppearanceMenuItems(menu);
+    AppendItemsAsSubMenu(menu, UI_TEXT_DISPLAY_MENU, AddDisplayMenuItems);
+    AppendItemsAsSubMenu(menu, UI_TEXT_APPEARANCE_MENU, AddAppearanceMenuItems);
+    AppendItemsAsSubMenu(menu, UI_TEXT_ICON_SCROLL_MENU,
+                         AddIconMarqueeMenuItems);
+    AppendItemsAsSubMenu(menu, UI_TEXT_STARTUP_MENU, AddStartupMenuItems);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, IDM_SAVE, UiText(UI_TEXT_SAVE));
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -1642,7 +1798,7 @@ static void HandleCommand(HWND hwnd, int commandId)
         SaveCurrentState(hwnd);
         break;
     case IDM_SAVE:
-        SaveCurrentState(hwnd);
+        SaveCurrentStateWithNotification(hwnd);
         break;
     case IDM_EXIT:
         ExitApplication(hwnd);
@@ -1659,6 +1815,11 @@ static void HandleCommand(HWND hwnd, int commandId)
         break;
     case IDM_FONT:
         if (ChooseEditorFont(hwnd)) {
+            SaveCurrentState(hwnd);
+        }
+        break;
+    case IDM_EDITOR_BACKGROUND_COLOR:
+        if (ChooseEditorBackgroundColor(hwnd)) {
             SaveCurrentState(hwnd);
         }
         break;
@@ -1744,6 +1905,16 @@ static void HandleCommand(HWND hwnd, int commandId)
 static LRESULT CALLBACK EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message) {
+    case WM_CHAR:
+        if (wParam == 1) {
+            SendMessageW(hwnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        if (wParam == 19) {
+            SaveCurrentStateWithNotification(g_mainWindow);
+            return 0;
+        }
+        break;
     case WM_MOUSEMOVE:
         TrackMouseLeave(hwnd, FALSE, &g_editMouseTracking);
         SetTitleHoverState(g_mainWindow, TRUE);
@@ -1906,6 +2077,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             UpdateIconMarquee(hwnd);
             return 0;
         }
+        if (wParam == IDT_SAVE_NOTIFICATION) {
+            FinishSaveNotification(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_CTLCOLOREDIT:
+        if ((HWND)lParam == g_editWindow) {
+            HDC editDc = (HDC)wParam;
+            SetBkColor(editDc, g_settings.editorBackgroundColor);
+            SetTextColor(editDc,
+                         GetReadableTitleTextColor(
+                             g_settings.editorBackgroundColor));
+            return (LRESULT)GetEditorBackgroundBrush();
+        }
         break;
 
     case WM_ERASEBKGND:
@@ -1978,11 +2164,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_ICON_MARQUEE);
+        KillTimer(hwnd, IDT_SAVE_NOTIFICATION);
         RemoveTrayIcon(hwnd);
         DestroyMarqueeIcons();
         if (g_editFont) {
             DeleteObject(g_editFont);
             g_editFont = NULL;
+        }
+        if (g_editBackgroundBrush) {
+            DeleteObject(g_editBackgroundBrush);
+            g_editBackgroundBrush = NULL;
         }
         PostQuitMessage(0);
         return 0;

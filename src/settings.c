@@ -36,6 +36,7 @@
 #define KEY_BORDER_COLOR L"BorderColor"
 #define KEY_TITLE_HOVER_ONLY L"TitleHoverOnly"
 #define KEY_ICON_MARQUEE L"IconMarquee"
+#define KEY_ICON_MARQUEE_REVERSE L"IconMarqueeReverse"
 #define KEY_ICON_MARQUEE_TEXT_COLOR L"IconMarqueeTextColor"
 #define KEY_ICON_MARQUEE_BACKGROUND_COLOR L"IconMarqueeBackgroundColor"
 #define KEY_ICON_MARQUEE_FONT_FACE L"IconMarqueeFontFace"
@@ -137,6 +138,7 @@ void InitDefaultSettings(AppSettings *settings)
     settings->borderColor = DEFAULT_BORDER_COLOR;
     settings->titleHoverOnly = DEFAULT_TITLE_HOVER_ONLY;
     settings->iconMarquee = DEFAULT_ICON_MARQUEE;
+    settings->iconMarqueeReverse = DEFAULT_ICON_MARQUEE_REVERSE;
     settings->iconMarqueeTextColor = DEFAULT_ICON_MARQUEE_TEXT_COLOR;
     settings->iconMarqueeBackgroundColor =
         DEFAULT_ICON_MARQUEE_BACKGROUND_COLOR;
@@ -353,6 +355,9 @@ BOOL LoadSettings(AppSettings *settings)
     settings->iconMarquee = GetPrivateProfileIntW(
         SECTION_APPEARANCE, KEY_ICON_MARQUEE,
         settings->iconMarquee, path) != 0;
+    settings->iconMarqueeReverse = GetPrivateProfileIntW(
+        SECTION_APPEARANCE, KEY_ICON_MARQUEE_REVERSE,
+        settings->iconMarqueeReverse, path) != 0;
     settings->iconMarqueeTextColor = (COLORREF)GetPrivateProfileIntW(
         SECTION_APPEARANCE, KEY_ICON_MARQUEE_TEXT_COLOR,
         (int)settings->iconMarqueeTextColor, path);
@@ -452,6 +457,9 @@ BOOL SaveSettings(const AppSettings *settings)
                              settings->titleHoverOnly ? 1 : 0);
     ok = ok && WriteIntValue(path, SECTION_APPEARANCE, KEY_ICON_MARQUEE,
                              settings->iconMarquee ? 1 : 0);
+    ok = ok && WriteIntValue(path, SECTION_APPEARANCE,
+                             KEY_ICON_MARQUEE_REVERSE,
+                             settings->iconMarqueeReverse ? 1 : 0);
     ok = ok && WriteIntValue(path, SECTION_APPEARANCE,
                              KEY_ICON_MARQUEE_TEXT_COLOR,
                              (int)settings->iconMarqueeTextColor);

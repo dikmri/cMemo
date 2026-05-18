@@ -22,6 +22,7 @@
 #define DEFAULT_BORDER_COLOR RGB(80, 120, 200)
 #define DEFAULT_TITLE_HOVER_ONLY TRUE
 #define DEFAULT_ICON_MARQUEE FALSE
+#define DEFAULT_ICON_MARQUEE_REVERSE FALSE
 #define DEFAULT_ICON_MARQUEE_TEXT_COLOR RGB(0, 0, 0)
 #define DEFAULT_ICON_MARQUEE_BACKGROUND_COLOR RGB(255, 255, 255)
 #define DEFAULT_ICON_MARQUEE_FONT_FACE L"Meiryo"
@@ -51,6 +52,7 @@ typedef struct AppSettings {
     COLORREF borderColor;
     BOOL titleHoverOnly;
     BOOL iconMarquee;
+    BOOL iconMarqueeReverse;
     COLORREF iconMarqueeTextColor;
     COLORREF iconMarqueeBackgroundColor;
     WCHAR iconMarqueeFontFace[LF_FACESIZE];

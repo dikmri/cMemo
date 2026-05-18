@@ -55,6 +55,17 @@
 #define IDM_ICON_MARQUEE_SPEED_FASTEST 40020
 #define IDM_ICON_MARQUEE_BACKGROUND_COLOR 40021
 #define IDM_EDITOR_BACKGROUND_COLOR 40022
+#define IDM_TOGGLE_ICON_MARQUEE_REVERSE 40023
+#define IDM_FONT_SIZE_6 40030
+#define IDM_FONT_SIZE_7 40031
+#define IDM_FONT_SIZE_8 40032
+#define IDM_FONT_SIZE_9 40033
+#define IDM_FONT_SIZE_10 40034
+#define IDM_FONT_SIZE_12 40035
+#define IDM_FONT_SIZE_14 40036
+#define IDM_FONT_SIZE_16 40037
+#define IDM_FONT_SIZE_18 40038
+#define IDM_FONT_SIZE_24 40039
 
 #define TRAY_ICON_UID 1
 #define WMAPP_TRAYICON (WM_APP + 1)
@@ -99,11 +110,13 @@ typedef enum UiTextId {
     UI_TEXT_DISPLAY_MENU,
     UI_TEXT_APPEARANCE_MENU,
     UI_TEXT_FONT,
+    UI_TEXT_FONT_SIZE,
     UI_TEXT_EDITOR_BACKGROUND_COLOR,
     UI_TEXT_WINDOW_COLOR,
     UI_TEXT_SHOW_TITLE_ON_HOVER_ONLY,
     UI_TEXT_ICON_SCROLL_MENU,
     UI_TEXT_SCROLL_MEMO_ON_ICON,
+    UI_TEXT_REVERSE_ICON_SCROLL,
     UI_TEXT_ICON_TEXT_COLOR,
     UI_TEXT_ICON_BACKGROUND_COLOR,
     UI_TEXT_ICON_FONT,
@@ -159,6 +172,10 @@ static const UiTextEntry g_uiTexts[UI_TEXT_COUNT] = {
         L"Font...",
         L"フォント..."
     },
+    [UI_TEXT_FONT_SIZE] = {
+        L"Font Size",
+        L"\u30D5\u30A9\u30F3\u30C8\u30B5\u30A4\u30BA"
+    },
     [UI_TEXT_EDITOR_BACKGROUND_COLOR] = {
         L"Editor Background Color...",
         L"\u5165\u529B\u6B04\u80CC\u666F\u8272..."
@@ -178,6 +195,10 @@ static const UiTextEntry g_uiTexts[UI_TEXT_COUNT] = {
     [UI_TEXT_SCROLL_MEMO_ON_ICON] = {
         L"Scroll Memo on Icon",
         L"メモをアイコンにスクロール表示"
+    },
+    [UI_TEXT_REVERSE_ICON_SCROLL] = {
+        L"Reverse Direction",
+        L"\u9006\u65B9\u5411\u306B\u6D41\u3059"
     },
     [UI_TEXT_ICON_TEXT_COLOR] = {
         L"Icon Text Color...",
@@ -837,6 +858,42 @@ static BOOL ChooseEditorFont(HWND owner)
     return TRUE;
 }
 
+static int GetFontSizeFromCommand(int commandId)
+{
+    switch (commandId) {
+    case IDM_FONT_SIZE_6:
+        return 6;
+    case IDM_FONT_SIZE_7:
+        return 7;
+    case IDM_FONT_SIZE_8:
+        return 8;
+    case IDM_FONT_SIZE_9:
+        return 9;
+    case IDM_FONT_SIZE_10:
+        return 10;
+    case IDM_FONT_SIZE_12:
+        return 12;
+    case IDM_FONT_SIZE_14:
+        return 14;
+    case IDM_FONT_SIZE_16:
+        return 16;
+    case IDM_FONT_SIZE_18:
+        return 18;
+    case IDM_FONT_SIZE_24:
+        return 24;
+    default:
+        return 0;
+    }
+}
+
+static void SetEditorFontPointSize(int pointSize)
+{
+    g_settings.fontPointSize = ClampInt(pointSize,
+                                        MIN_FONT_POINT_SIZE,
+                                        MAX_FONT_POINT_SIZE);
+    ApplyEditorFont();
+}
+
 static BOOL ChooseEditorBackgroundColor(HWND owner)
 {
     static COLORREF customColors[16];
@@ -1376,14 +1433,22 @@ static HICON CreateMarqueeIcon(int width, int height, LPCWSTR text)
 
     gap = max(width / 2, 8);
     totalWidth = max(1, textSize.cx + gap);
-    x = width - (g_marqueeOffset % totalWidth);
+    if (g_settings.iconMarqueeReverse) {
+        x = (g_marqueeOffset % totalWidth) - textSize.cx;
+    } else {
+        x = width - (g_marqueeOffset % totalWidth);
+    }
     y = max(0, (height - textSize.cy) / 2);
 
     SetBkMode(memoryDc, TRANSPARENT);
     SetTextColor(memoryDc, g_settings.iconMarqueeTextColor);
     IntersectClipRect(memoryDc, 0, 0, width, height);
     TextOutW(memoryDc, x, y, text, textLength);
-    if (x + textSize.cx < width) {
+    if (g_settings.iconMarqueeReverse) {
+        if (x > 0) {
+            TextOutW(memoryDc, x - totalWidth, y, text, textLength);
+        }
+    } else if (x + textSize.cx < width) {
         TextOutW(memoryDc, x + totalWidth, y, text, textLength);
     }
 
@@ -1623,11 +1688,48 @@ static void AddIconMarqueeSpeedMenu(HMENU menu)
                 UiText(UI_TEXT_ICON_SCROLL_SPEED));
 }
 
+static void AppendFontSizeItem(HMENU menu, int pointSize, UINT commandId)
+{
+    WCHAR label[16];
+    UINT checked = g_settings.fontPointSize == pointSize ? MF_CHECKED : 0;
+
+    if (FAILED(StringCchPrintfW(label, ARRAYSIZE(label),
+                                L"%d pt", pointSize))) {
+        return;
+    }
+
+    AppendMenuW(menu, MF_STRING | checked, commandId, label);
+}
+
+static void AddFontSizeMenu(HMENU menu)
+{
+    HMENU fontSizeMenu = CreatePopupMenu();
+
+    if (!fontSizeMenu) {
+        return;
+    }
+
+    AppendFontSizeItem(fontSizeMenu, 6, IDM_FONT_SIZE_6);
+    AppendFontSizeItem(fontSizeMenu, 7, IDM_FONT_SIZE_7);
+    AppendFontSizeItem(fontSizeMenu, 8, IDM_FONT_SIZE_8);
+    AppendFontSizeItem(fontSizeMenu, 9, IDM_FONT_SIZE_9);
+    AppendFontSizeItem(fontSizeMenu, 10, IDM_FONT_SIZE_10);
+    AppendFontSizeItem(fontSizeMenu, 12, IDM_FONT_SIZE_12);
+    AppendFontSizeItem(fontSizeMenu, 14, IDM_FONT_SIZE_14);
+    AppendFontSizeItem(fontSizeMenu, 16, IDM_FONT_SIZE_16);
+    AppendFontSizeItem(fontSizeMenu, 18, IDM_FONT_SIZE_18);
+    AppendFontSizeItem(fontSizeMenu, 24, IDM_FONT_SIZE_24);
+
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)fontSizeMenu,
+                UiText(UI_TEXT_FONT_SIZE));
+}
+
 static void AddAppearanceMenuItems(HMENU menu)
 {
     UINT titleHoverChecked = g_settings.titleHoverOnly ? MF_CHECKED : 0;
 
     AppendMenuW(menu, MF_STRING, IDM_FONT, UiText(UI_TEXT_FONT));
+    AddFontSizeMenu(menu);
     AppendMenuW(menu, MF_STRING, IDM_EDITOR_BACKGROUND_COLOR,
                 UiText(UI_TEXT_EDITOR_BACKGROUND_COLOR));
     AppendMenuW(menu, MF_STRING, IDM_BORDER_COLOR,
@@ -1640,10 +1742,15 @@ static void AddAppearanceMenuItems(HMENU menu)
 static void AddIconMarqueeMenuItems(HMENU menu)
 {
     UINT iconMarqueeChecked = g_settings.iconMarquee ? MF_CHECKED : 0;
+    UINT iconMarqueeReverseChecked =
+        g_settings.iconMarqueeReverse ? MF_CHECKED : 0;
 
     AppendMenuW(menu, MF_STRING | iconMarqueeChecked,
                 IDM_TOGGLE_ICON_MARQUEE,
                 UiText(UI_TEXT_SCROLL_MEMO_ON_ICON));
+    AppendMenuW(menu, MF_STRING | iconMarqueeReverseChecked,
+                IDM_TOGGLE_ICON_MARQUEE_REVERSE,
+                UiText(UI_TEXT_REVERSE_ICON_SCROLL));
     AppendMenuW(menu, MF_STRING, IDM_ICON_MARQUEE_TEXT_COLOR,
                 UiText(UI_TEXT_ICON_TEXT_COLOR));
     AppendMenuW(menu, MF_STRING, IDM_ICON_MARQUEE_BACKGROUND_COLOR,
@@ -1818,6 +1925,19 @@ static void HandleCommand(HWND hwnd, int commandId)
             SaveCurrentState(hwnd);
         }
         break;
+    case IDM_FONT_SIZE_6:
+    case IDM_FONT_SIZE_7:
+    case IDM_FONT_SIZE_8:
+    case IDM_FONT_SIZE_9:
+    case IDM_FONT_SIZE_10:
+    case IDM_FONT_SIZE_12:
+    case IDM_FONT_SIZE_14:
+    case IDM_FONT_SIZE_16:
+    case IDM_FONT_SIZE_18:
+    case IDM_FONT_SIZE_24:
+        SetEditorFontPointSize(GetFontSizeFromCommand(commandId));
+        SaveCurrentState(hwnd);
+        break;
     case IDM_EDITOR_BACKGROUND_COLOR:
         if (ChooseEditorBackgroundColor(hwnd)) {
             SaveCurrentState(hwnd);
@@ -1840,6 +1960,14 @@ static void HandleCommand(HWND hwnd, int commandId)
             StartIconMarquee(hwnd);
         } else {
             StopIconMarquee(hwnd);
+        }
+        SaveCurrentState(hwnd);
+        break;
+    case IDM_TOGGLE_ICON_MARQUEE_REVERSE:
+        g_settings.iconMarqueeReverse = !g_settings.iconMarqueeReverse;
+        g_marqueeOffset = 0;
+        if (g_settings.iconMarquee) {
+            UpdateIconMarquee(hwnd);
         }
         SaveCurrentState(hwnd);
         break;

@@ -11,13 +11,19 @@
 #include <shellapi.h>
 #include <commdlg.h>
 #include <dwmapi.h>
+#include <wininet.h>
 #include <strsafe.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "resource.h"
 #include "settings.h"
 
 #define APP_TITLE L"cMemo"
 #define WINDOW_CLASS_NAME L"cMemoWindow"
+#define GITHUB_LATEST_RELEASE_API \
+    L"https://api.github.com/repos/dikmri/cMemo/releases/latest"
+#define UPDATE_USER_AGENT L"cMemo/" APP_VERSION_WIDE
 
 #define ID_EDIT 1001
 
@@ -72,6 +78,7 @@
 
 #define TRAY_ICON_UID 1
 #define WMAPP_TRAYICON (WM_APP + 1)
+#define WMAPP_UPDATE_READY (WM_APP + 2)
 #define RUN_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define RUN_VALUE_NAME L"cMemo"
 
@@ -102,6 +109,9 @@ static HICON g_marqueeSmallIcon = NULL;
 static HICON g_marqueeBigIcon = NULL;
 static int g_marqueeOffset = 0;
 static UINT g_taskbarCreatedMessage = 0;
+static BOOL g_updateCheckStarted = FALSE;
+static WCHAR g_pendingUpdatePath[MAX_PATH];
+static WCHAR g_pendingUpdateVersion[32];
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 static LRESULT CALLBACK EditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -110,6 +120,8 @@ static void UpdateIconMarquee(HWND hwnd);
 static void StartIconMarquee(HWND hwnd);
 static void StopIconMarquee(HWND hwnd);
 static void RefreshEditorScrollBar(HWND hwnd, BOOL updateLayout);
+static void StartUpdateCheck(HWND hwnd);
+static BOOL SaveCurrentState(HWND hwnd);
 
 typedef enum UiTextId {
     UI_TEXT_ALWAYS_ON_TOP = 0,
@@ -1091,6 +1103,606 @@ static BOOL GetRunCommand(WCHAR *buffer, DWORD cchBuffer)
 
     return SUCCEEDED(StringCchPrintfW(buffer, cchBuffer,
                                       L"\"%s\"", modulePath));
+}
+
+static BOOL ReadUrlToMemory(LPCWSTR url, BYTE **data, DWORD *dataSize,
+                            DWORD maxBytes)
+{
+    HINTERNET internet = NULL;
+    HINTERNET request = NULL;
+    BYTE *buffer = NULL;
+    DWORD capacity = 0;
+    DWORD size = 0;
+    BOOL ok = FALSE;
+    static const WCHAR headers[] =
+        L"Accept: application/vnd.github+json, application/octet-stream\r\n"
+        L"X-GitHub-Api-Version: 2022-11-28\r\n";
+
+    if (!url || !data || !dataSize || maxBytes == 0) {
+        return FALSE;
+    }
+
+    *data = NULL;
+    *dataSize = 0;
+
+    internet = InternetOpenW(UPDATE_USER_AGENT,
+                             INTERNET_OPEN_TYPE_PRECONFIG,
+                             NULL,
+                             NULL,
+                             0);
+    if (!internet) {
+        goto cleanup;
+    }
+
+    request = InternetOpenUrlW(internet,
+                               url,
+                               headers,
+                               (DWORD)(sizeof(headers) / sizeof(headers[0]) - 1),
+                               INTERNET_FLAG_RELOAD |
+                                   INTERNET_FLAG_NO_CACHE_WRITE |
+                                   INTERNET_FLAG_NO_UI,
+                               0);
+    if (!request) {
+        goto cleanup;
+    }
+
+    capacity = 8192;
+    buffer = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                               capacity + 1);
+    if (!buffer) {
+        goto cleanup;
+    }
+
+    for (;;) {
+        BYTE chunk[4096];
+        DWORD bytesRead = 0;
+
+        if (!InternetReadFile(request, chunk, sizeof(chunk), &bytesRead)) {
+            goto cleanup;
+        }
+        if (bytesRead == 0) {
+            break;
+        }
+        if (size + bytesRead > maxBytes) {
+            goto cleanup;
+        }
+        if (size + bytesRead + 1 > capacity) {
+            DWORD newCapacity = max(capacity * 2, size + bytesRead + 1);
+            BYTE *newBuffer = (BYTE *)HeapReAlloc(GetProcessHeap(),
+                                                  HEAP_ZERO_MEMORY,
+                                                  buffer,
+                                                  newCapacity + 1);
+            if (!newBuffer) {
+                goto cleanup;
+            }
+            buffer = newBuffer;
+            capacity = newCapacity;
+        }
+        CopyMemory(buffer + size, chunk, bytesRead);
+        size += bytesRead;
+    }
+
+    buffer[size] = '\0';
+    *data = buffer;
+    *dataSize = size;
+    buffer = NULL;
+    ok = TRUE;
+
+cleanup:
+    if (buffer) {
+        HeapFree(GetProcessHeap(), 0, buffer);
+    }
+    if (request) {
+        InternetCloseHandle(request);
+    }
+    if (internet) {
+        InternetCloseHandle(internet);
+    }
+    return ok;
+}
+
+static BOOL DownloadUrlToFile(LPCWSTR url, LPCWSTR path, DWORD maxBytes)
+{
+    BYTE *data = NULL;
+    DWORD dataSize = 0;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    DWORD written = 0;
+    BOOL ok = FALSE;
+
+    if (!ReadUrlToMemory(url, &data, &dataSize, maxBytes)) {
+        return FALSE;
+    }
+
+    file = CreateFileW(path,
+                       GENERIC_WRITE,
+                       0,
+                       NULL,
+                       CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL,
+                       NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        goto cleanup;
+    }
+
+    ok = WriteFile(file, data, dataSize, &written, NULL) &&
+         written == dataSize;
+
+cleanup:
+    if (file != INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+    }
+    if (data) {
+        HeapFree(GetProcessHeap(), 0, data);
+    }
+    if (!ok) {
+        DeleteFileW(path);
+    }
+    return ok;
+}
+
+static BOOL ExtractJsonStringValue(const char *start, char *buffer,
+                                   size_t bufferSize)
+{
+    const char *cursor = start;
+    size_t writeIndex = 0;
+
+    if (!start || !buffer || bufferSize == 0) {
+        return FALSE;
+    }
+
+    buffer[0] = '\0';
+    while (*cursor && *cursor != '"') {
+        ++cursor;
+    }
+    if (*cursor != '"') {
+        return FALSE;
+    }
+    ++cursor;
+
+    while (*cursor && *cursor != '"') {
+        if (*cursor == '\\' && cursor[1]) {
+            ++cursor;
+        }
+        if (writeIndex + 1 >= bufferSize) {
+            return FALSE;
+        }
+        buffer[writeIndex++] = *cursor++;
+    }
+
+    if (*cursor != '"') {
+        return FALSE;
+    }
+
+    buffer[writeIndex] = '\0';
+    return TRUE;
+}
+
+static BOOL FindJsonStringValue(const char *json, const char *key,
+                                char *buffer, size_t bufferSize)
+{
+    const char *keyPosition = NULL;
+    const char *colon = NULL;
+    const char *value = NULL;
+
+    if (!json || !key || !buffer || bufferSize == 0) {
+        return FALSE;
+    }
+
+    keyPosition = strstr(json, key);
+    if (!keyPosition) {
+        return FALSE;
+    }
+
+    colon = strchr(keyPosition, ':');
+    if (!colon) {
+        return FALSE;
+    }
+
+    value = colon + 1;
+    while (*value == ' ' || *value == '\t' ||
+           *value == '\r' || *value == '\n') {
+        ++value;
+    }
+
+    return ExtractJsonStringValue(value, buffer, bufferSize);
+}
+
+static BOOL FindReleaseExeDownloadUrl(const char *json, char *buffer,
+                                      size_t bufferSize)
+{
+    const char *cursor = json;
+
+    if (!json || !buffer || bufferSize == 0) {
+        return FALSE;
+    }
+
+    buffer[0] = '\0';
+    while ((cursor = strstr(cursor, "\"browser_download_url\"")) != NULL) {
+        const char *colon = strchr(cursor, ':');
+        const char *value = colon ? colon + 1 : NULL;
+        char url[2048];
+
+        if (!value) {
+            return FALSE;
+        }
+        while (*value == ' ' || *value == '\t' ||
+               *value == '\r' || *value == '\n') {
+            ++value;
+        }
+        if (ExtractJsonStringValue(value, url, sizeof(url)) &&
+            strstr(url, "cMemo-") &&
+            strstr(url, ".exe")) {
+            return SUCCEEDED(StringCchCopyA(buffer, bufferSize, url));
+        }
+        ++cursor;
+    }
+
+    return FALSE;
+}
+
+static BOOL Utf8ToWideString(const char *source, WCHAR *destination,
+                             int cchDestination)
+{
+    int written = 0;
+
+    if (!source || !destination || cchDestination <= 0) {
+        return FALSE;
+    }
+
+    written = MultiByteToWideChar(CP_UTF8,
+                                  0,
+                                  source,
+                                  -1,
+                                  destination,
+                                  cchDestination);
+    return written > 0;
+}
+
+static void NormalizeVersionString(const char *source, char *destination,
+                                   size_t destinationSize)
+{
+    if (!source || !destination || destinationSize == 0) {
+        return;
+    }
+
+    if (source[0] == 'v' || source[0] == 'V') {
+        ++source;
+    }
+    StringCchCopyA(destination, destinationSize, source);
+}
+
+static int CompareVersionStrings(const char *latest, const char *current)
+{
+    char latestNormalized[32];
+    char currentNormalized[32];
+    int latestParts[3] = {0, 0, 0};
+    int currentParts[3] = {0, 0, 0};
+    char *context = NULL;
+    char *token = NULL;
+    int i = 0;
+
+    NormalizeVersionString(latest, latestNormalized,
+                           sizeof(latestNormalized));
+    NormalizeVersionString(current, currentNormalized,
+                           sizeof(currentNormalized));
+
+    token = strtok_s(latestNormalized, ".", &context);
+    while (token && i < 3) {
+        latestParts[i++] = atoi(token);
+        token = strtok_s(NULL, ".", &context);
+    }
+
+    context = NULL;
+    i = 0;
+    token = strtok_s(currentNormalized, ".", &context);
+    while (token && i < 3) {
+        currentParts[i++] = atoi(token);
+        token = strtok_s(NULL, ".", &context);
+    }
+
+    for (i = 0; i < 3; ++i) {
+        if (latestParts[i] > currentParts[i]) {
+            return 1;
+        }
+        if (latestParts[i] < currentParts[i]) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static BOOL IsDownloadedUpdateExecutable(LPCWSTR path)
+{
+    HANDLE file = INVALID_HANDLE_VALUE;
+    BYTE signature[2];
+    DWORD bytesRead = 0;
+    BOOL ok = FALSE;
+
+    file = CreateFileW(path,
+                       GENERIC_READ,
+                       FILE_SHARE_READ,
+                       NULL,
+                       OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL,
+                       NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+
+    ok = ReadFile(file, signature, sizeof(signature), &bytesRead, NULL) &&
+         bytesRead == sizeof(signature) &&
+         signature[0] == 'M' &&
+         signature[1] == 'Z';
+    CloseHandle(file);
+    return ok;
+}
+
+static BOOL WidePathToBatchPath(LPCWSTR source, CHAR *destination,
+                                size_t cchDestination)
+{
+    CHAR converted[MAX_PATH * 4];
+    int convertedLength = 0;
+    size_t writeIndex = 0;
+    int i = 0;
+
+    if (!source || !destination || cchDestination == 0) {
+        return FALSE;
+    }
+
+    destination[0] = '\0';
+    convertedLength = WideCharToMultiByte(CP_ACP,
+                                          0,
+                                          source,
+                                          -1,
+                                          converted,
+                                          sizeof(converted),
+                                          NULL,
+                                          NULL);
+    if (convertedLength <= 0) {
+        return FALSE;
+    }
+
+    for (i = 0; converted[i] != '\0'; ++i) {
+        if (converted[i] == '\r' || converted[i] == '\n') {
+            return FALSE;
+        }
+        if (converted[i] == '%') {
+            if (writeIndex + 2 >= cchDestination) {
+                return FALSE;
+            }
+            destination[writeIndex++] = '%';
+            destination[writeIndex++] = '%';
+        } else {
+            if (writeIndex + 1 >= cchDestination) {
+                return FALSE;
+            }
+            destination[writeIndex++] = converted[i];
+        }
+    }
+
+    destination[writeIndex] = '\0';
+    return TRUE;
+}
+
+static BOOL WriteUpdaterScript(LPCWSTR updateExePath, LPCWSTR targetExePath,
+                               WCHAR *scriptPath, DWORD cchScriptPath)
+{
+    WCHAR tempPath[MAX_PATH];
+    CHAR updatePathA[MAX_PATH * 4];
+    CHAR targetPathA[MAX_PATH * 4];
+    CHAR scriptPathA[MAX_PATH * 4];
+    CHAR script[2048];
+    HANDLE file = INVALID_HANDLE_VALUE;
+    DWORD written = 0;
+    size_t scriptLength = 0;
+
+    if (!updateExePath || !targetExePath || !scriptPath ||
+        cchScriptPath == 0) {
+        return FALSE;
+    }
+
+    if (GetTempPathW(ARRAYSIZE(tempPath), tempPath) == 0) {
+        return FALSE;
+    }
+
+    if (FAILED(StringCchPrintfW(scriptPath, cchScriptPath,
+                                L"%scMemo-update.cmd", tempPath))) {
+        return FALSE;
+    }
+
+    if (!WidePathToBatchPath(updateExePath, updatePathA,
+                             ARRAYSIZE(updatePathA)) ||
+        !WidePathToBatchPath(targetExePath, targetPathA,
+                             ARRAYSIZE(targetPathA)) ||
+        !WidePathToBatchPath(scriptPath, scriptPathA,
+                             ARRAYSIZE(scriptPathA))) {
+        return FALSE;
+    }
+
+    if (FAILED(StringCchPrintfA(
+        script,
+        ARRAYSIZE(script),
+        "@echo off\r\n"
+        "set COUNT=0\r\n"
+        ":retry\r\n"
+        "set /a COUNT+=1\r\n"
+        "copy /Y \"%s\" \"%s\" >nul 2>nul\r\n"
+        "if errorlevel 1 (\r\n"
+        "  if %%COUNT%% GEQ 60 exit /b 1\r\n"
+        "  timeout /t 1 /nobreak >nul\r\n"
+        "  goto retry\r\n"
+        ")\r\n"
+        "start \"\" \"%s\"\r\n"
+        "del \"%s\" >nul 2>nul\r\n"
+        "del \"%s\" >nul 2>nul\r\n",
+        updatePathA,
+        targetPathA,
+        targetPathA,
+        updatePathA,
+        scriptPathA))) {
+        return FALSE;
+    }
+    scriptLength = strlen(script);
+
+    file = CreateFileW(scriptPath,
+                       GENERIC_WRITE,
+                       0,
+                       NULL,
+                       CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL,
+                       NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        DeleteFileW(scriptPath);
+        return FALSE;
+    }
+
+    if (!WriteFile(file, script, (DWORD)scriptLength, &written, NULL) ||
+        written != (DWORD)scriptLength) {
+        CloseHandle(file);
+        DeleteFileW(scriptPath);
+        return FALSE;
+    }
+
+    CloseHandle(file);
+    return TRUE;
+}
+
+static BOOL LaunchUpdaterAndExit(HWND hwnd)
+{
+    WCHAR modulePath[MAX_PATH];
+    WCHAR scriptPath[MAX_PATH];
+    WCHAR commandLine[MAX_PATH * 2];
+    STARTUPINFOW startupInfo;
+    PROCESS_INFORMATION processInfo;
+
+    if (GetModuleFileNameW(NULL, modulePath, ARRAYSIZE(modulePath)) == 0) {
+        return FALSE;
+    }
+
+    if (!WriteUpdaterScript(g_pendingUpdatePath, modulePath,
+                            scriptPath, ARRAYSIZE(scriptPath))) {
+        return FALSE;
+    }
+
+    if (FAILED(StringCchPrintfW(commandLine, ARRAYSIZE(commandLine),
+                                L"cmd.exe /c \"\"%s\"\"",
+                                scriptPath))) {
+        DeleteFileW(scriptPath);
+        return FALSE;
+    }
+
+    ZeroMemory(&startupInfo, sizeof(startupInfo));
+    startupInfo.cb = sizeof(startupInfo);
+    startupInfo.dwFlags = STARTF_USESHOWWINDOW;
+    startupInfo.wShowWindow = SW_HIDE;
+    ZeroMemory(&processInfo, sizeof(processInfo));
+
+    if (!CreateProcessW(NULL,
+                        commandLine,
+                        NULL,
+                        NULL,
+                        FALSE,
+                        CREATE_NO_WINDOW,
+                        NULL,
+                        NULL,
+                        &startupInfo,
+                        &processInfo)) {
+        DeleteFileW(scriptPath);
+        return FALSE;
+    }
+
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    g_isExiting = TRUE;
+    SaveCurrentState(hwnd);
+    DestroyWindow(hwnd);
+    return TRUE;
+}
+
+static DWORD WINAPI UpdateCheckThreadProc(LPVOID parameter)
+{
+    HWND hwnd = (HWND)parameter;
+    BYTE *jsonBytes = NULL;
+    DWORD jsonSize = 0;
+    char latestTag[64];
+    char downloadUrl[2048];
+    char latestVersion[64];
+    WCHAR downloadUrlW[2048];
+    WCHAR tempPath[MAX_PATH];
+    WCHAR updatePath[MAX_PATH];
+
+    UNREFERENCED_PARAMETER(jsonSize);
+
+    if (!ReadUrlToMemory(GITHUB_LATEST_RELEASE_API,
+                         &jsonBytes,
+                         &jsonSize,
+                         1024 * 1024)) {
+        return 0;
+    }
+
+    if (!FindJsonStringValue((const char *)jsonBytes,
+                             "\"tag_name\"",
+                             latestTag,
+                             sizeof(latestTag)) ||
+        !FindReleaseExeDownloadUrl((const char *)jsonBytes,
+                                   downloadUrl,
+                                   sizeof(downloadUrl))) {
+        HeapFree(GetProcessHeap(), 0, jsonBytes);
+        return 0;
+    }
+    HeapFree(GetProcessHeap(), 0, jsonBytes);
+
+    NormalizeVersionString(latestTag, latestVersion, sizeof(latestVersion));
+    if (CompareVersionStrings(latestVersion, APP_VERSION_STRING) <= 0) {
+        return 0;
+    }
+
+    if (!Utf8ToWideString(downloadUrl, downloadUrlW,
+                          ARRAYSIZE(downloadUrlW))) {
+        return 0;
+    }
+
+    if (GetTempPathW(ARRAYSIZE(tempPath), tempPath) == 0 ||
+        FAILED(StringCchPrintfW(updatePath, ARRAYSIZE(updatePath),
+                                L"%scMemo-update-%S.exe",
+                                tempPath,
+                                latestVersion))) {
+        return 0;
+    }
+
+    if (!DownloadUrlToFile(downloadUrlW, updatePath, 64 * 1024 * 1024) ||
+        !IsDownloadedUpdateExecutable(updatePath)) {
+        DeleteFileW(updatePath);
+        return 0;
+    }
+
+    StringCchCopyW(g_pendingUpdatePath, ARRAYSIZE(g_pendingUpdatePath),
+                   updatePath);
+    if (!Utf8ToWideString(latestVersion,
+                          g_pendingUpdateVersion,
+                          ARRAYSIZE(g_pendingUpdateVersion))) {
+        g_pendingUpdateVersion[0] = L'\0';
+    }
+
+    if (IsWindow(hwnd)) {
+        PostMessageW(hwnd, WMAPP_UPDATE_READY, 0, 0);
+    }
+    return 0;
+}
+
+static void StartUpdateCheck(HWND hwnd)
+{
+    HANDLE thread = NULL;
+
+    if (g_updateCheckStarted || !IsWindow(hwnd)) {
+        return;
+    }
+
+    g_updateCheckStarted = TRUE;
+    thread = CreateThread(NULL, 0, UpdateCheckThreadProc, hwnd, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+    }
 }
 
 static BOOL IsAutoStartEnabled(void)
@@ -2509,6 +3121,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         return 0;
     }
 
+    if (message == WMAPP_UPDATE_READY) {
+        LaunchUpdaterAndExit(hwnd);
+        return 0;
+    }
+
     switch (message) {
     case WM_NCCALCSIZE:
         return 0;
@@ -2535,6 +3152,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (g_settings.iconMarquee) {
             StartIconMarquee(hwnd);
         }
+        StartUpdateCheck(hwnd);
         return 0;
 
     case WM_SIZE:

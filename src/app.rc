@@ -4,8 +4,8 @@
 IDI_APPICON ICON "../resources/app.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,1,0,0
- PRODUCTVERSION 1,1,0,0
+ FILEVERSION APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,APP_VERSION_BUILD
+ PRODUCTVERSION APP_VERSION_MAJOR,APP_VERSION_MINOR,APP_VERSION_PATCH,APP_VERSION_BUILD
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -18,11 +18,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "cMemo\0"
             VALUE "FileDescription", "cMemo\0"
-            VALUE "FileVersion", "1.1.0\0"
+            VALUE "FileVersion", APP_VERSION_STRING "\0"
             VALUE "InternalName", "cMemo\0"
             VALUE "OriginalFilename", "cMemo.exe\0"
             VALUE "ProductName", "cMemo\0"
-            VALUE "ProductVersion", "1.1.0\0"
+            VALUE "ProductVersion", APP_VERSION_STRING "\0"
         END
     END
     BLOCK "VarFileInfo"

@@ -28,20 +28,23 @@ jobs:
           x86_64-w64-mingw32-windres src/app.rc -O coff -o dist/app.res
           x86_64-w64-mingw32-gcc src/main.c src/settings.c dist/app.res \
             -municode -mwindows \
-            -lcomdlg32 -ldwmapi -lshell32 -lgdi32 \
+            -lcomdlg32 -ldwmapi -lshell32 -lgdi32 -lwininet \
             -o dist/cMemo.exe
 
       - name: Package
         run: |
           mkdir -p release
           cp dist/cMemo.exe release/cMemo.exe
+          cp dist/cMemo.exe "cMemo-${GITHUB_REF_NAME}.exe"
           (cd release && zip "../cMemo-${GITHUB_REF_NAME}.zip" cMemo.exe)
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" "cMemo-${GITHUB_REF_NAME}.zip" \
+          gh release create "${GITHUB_REF_NAME}" \
+            "cMemo-${GITHUB_REF_NAME}.zip" \
+            "cMemo-${GITHUB_REF_NAME}.exe" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "cMemo ${GITHUB_REF_NAME}" \
             --notes "cMemo ${GITHUB_REF_NAME} のリリースです。"

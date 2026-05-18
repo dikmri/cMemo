@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 zip
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          x86_64-w64-mingw32-windres src/app.rc -O coff -o dist/app.res
+          x86_64-w64-mingw32-gcc src/main.c src/settings.c dist/app.res \
+            -municode -mwindows \
+            -lcomdlg32 -ldwmapi -lshell32 -lgdi32 \
+            -o dist/cMemo.exe
+
+      - name: Package
+        run: |
+          mkdir -p release
+          cp dist/cMemo.exe release/cMemo.exe
+          (cd release && zip "../cMemo-${GITHUB_REF_NAME}.zip" cMemo.exe)
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" "cMemo-${GITHUB_REF_NAME}.zip" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "cMemo ${GITHUB_REF_NAME}" \
+            --notes "cMemo ${GITHUB_REF_NAME} のリリースです。"
